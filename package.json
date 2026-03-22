@@ -1,0 +1,29 @@
+{
+  "name": "follower-bot",
+  "version": "1.0.0",
+  "description": "Bot that follows Meteora DAMM v2 swaps from a target wallet using Jupiter Ultra API",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [
+    "solana",
+    "follower-bot",
+    "jupiter",
+    "trading-bot"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.8",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "typescript": "^5.4.5",
+    "ts-node": "^10.9.2"
+  }
+}
