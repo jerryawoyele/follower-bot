@@ -1,19 +1,15 @@
-# fly.toml app configuration file generated for follower-bot on 2026-03-23T00:51:51+01:00
+# fly.toml app configuration file generated for follower-bot-e3nkpg on 2026-03-22T23:55:30Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'follower-bot'
+app = 'follower-bot-e3nkpg'
 primary_region = 'fra'
 
-[env]
-  NODE_ENV = "production"
-
-[processes]
-  app = "npm start"
+[build]
 
 [http_service]
-  internal_port = 3000
+  internal_port = 8080
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
@@ -24,4 +20,4 @@ primary_region = 'fra'
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 1024
+  memory_mb = 256
