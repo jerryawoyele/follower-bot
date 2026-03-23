@@ -10,7 +10,7 @@ primary_region = 'fra'
   NODE_ENV = "production"
 
 [processes]
-  app = "npm start"
+  app = "npm run dev"
 
 [http_service]
   internal_port = 3000
