@@ -21,4 +21,4 @@ RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 
 # Run the bot
-CMD ["node", "dist/index.js"]
+CMD ["ts-node", "src/index.ts"]

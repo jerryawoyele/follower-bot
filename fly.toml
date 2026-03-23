@@ -7,6 +7,11 @@ app = 'follower-bot-e3nkpg'
 primary_region = 'fra'
 
 [build]
+[env]
+  NODE_ENV = "production"
+
+[processes]
+  app = "npm run dev"
 
 [http_service]
   internal_port = 8080
