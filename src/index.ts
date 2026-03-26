@@ -1045,7 +1045,7 @@ export class MeteoraDammV2CopyBot {
   }
 
   private async checkPool(): Promise<void> {
-    const profitExitPercent = this.config.profitExitPercent ?? 10;
+    const profitExitPercent = this.config.profitExitPercent ?? 1;
     const poolRpcUrl = this.config.poolRpcUrl ?? this.config.rpcUrl;
 
     // ===== PHASE 1: Monitor PENDING positions (state machine decides entry) =====
@@ -2024,7 +2024,7 @@ async function main() {
     priceCheckIntervalMs: Number(process.env.PRICE_CHECK_INTERVAL_MS ?? "5000"),
     poolRpcUrl: process.env.POOL_RPC_URL,
     poolCheckIntervalMs: Number(process.env.POOL_CHECK_INTERVAL_MS ?? "2000"),
-    profitExitPercent: Number(process.env.PROFIT_EXIT_PERCENT ?? "20"),
+    profitExitPercent: Number(process.env.PROFIT_EXIT_PERCENT ?? "1"),
   });
 
   await bot.start();
