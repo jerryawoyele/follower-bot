@@ -135,6 +135,12 @@ type PendingPosition = {
   impactHistory: number[]; // last 5 impacts
   lastPriceMove: number;
   priceMoveHistory: number[]; // last 5 price moves
+  // Enhanced momentum tracking
+  momentumScore: number; // Current momentum score
+  momentumHistory: number[]; // last 5 momentum scores
+  momentumIncreasing: boolean; // Is momentum increasing?
+  dipsAbsorbed: number; // Count of dips that were absorbed (sell followed by stronger buy)
+  lastDipRecovery: number; // Last dip recovery strength
 };
 
 type FollowState = {
@@ -164,6 +170,15 @@ type FollowState = {
   lastSellMove: number; // Last sell price move
   entryPrice?: number; // Price at entry (from pool)
   highestProfit: number; // Highest profit % reached
+  // Enhanced momentum tracking for exits
+  momentumScore: number;
+  momentumHistory: number[];
+  momentumIncreasing: boolean;
+  consecutiveBuys: number;
+  consecutiveSells: number;
+  dipsAbsorbed: number;
+  lastDipRecovery: number;
+  trendBroken: boolean; // Has the trend definitively broken?
 };
 
 // Helius API types
@@ -1125,26 +1140,61 @@ export class MeteoraDammV2CopyBot {
           avgImpact * 100 -
           pending.flipCount * 0.5;
 
+        // ===== ENHANCED MOMENTUM TRACKING =====
+        // Track momentum history
+        pending.momentumHistory.push(momentumScore);
+        if (pending.momentumHistory.length > 5) pending.momentumHistory.shift();
+        
+        // Detect momentum increasing (comparing to previous)
+        const prevMomentum = pending.momentumHistory.length > 1 
+          ? pending.momentumHistory[pending.momentumHistory.length - 2] 
+          : 0;
+        pending.momentumIncreasing = momentumScore > prevMomentum && momentumScore > 0;
+        pending.momentumScore = momentumScore;
+
+        // Dip absorption detection (sell followed by stronger buy)
+        if (sellPressure && pending.consecutiveBuys === 0) {
+          // Just saw a sell, mark potential dip
+          pending.lastDipRecovery = -Math.abs(priceMovePct);
+        } else if (buyPressure && pending.lastDipRecovery < 0) {
+          // Buy after a dip - check if it absorbed the dip
+          const recoveryStrength = priceMovePct - pending.lastDipRecovery;
+          if (recoveryStrength > 0.01) { // Recovery stronger than dip
+            pending.dipsAbsorbed++;
+            pending.lastDipRecovery = priceMovePct;
+          }
+        }
+
         // ===== EXTREME EVENTS =====
         const extremeDump = priceMovePct < -0.5 || quoteImpactPct > 0.3;
         const possibleLiquidityPull =
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
         
-        // Fixed unstable detection - only if lots of flips AND weak volume
-        const isUnstable = pending.flipCount > 5 && avgImpact < 0.02;
+        // ===== FIXED UNSTABLE DETECTION =====
+        // Unstable only if lots of flips AND NO strong trend forming
+        // Strong trend (consecBuys >= 3) OVERRIDES instability
+        const hasStrongTrend = pending.consecutiveBuys >= 3;
+        const hasMomentum = momentumScore > 0 && pending.momentumIncreasing;
+        const isUnstable = pending.flipCount > 5 && avgImpact < 0.02 && !hasStrongTrend && !hasMomentum;
         
         // Dead token - no movement for 10+ intervals
         const isDeadToken = pending.noMovementCount >= 10;
         
-        const weakTrend = pending.weakTrendCounter > 2;
-        const noRecovery = pending.recoveryFails > 2;
+        const weakTrend = pending.weakTrendCounter > 2 && !hasMomentum;
+        const noRecovery = pending.recoveryFails > 3;
+
+        // ===== TREND OVERRIDE CONDITIONS =====
+        // Even if unstable, allow entry if strong momentum is building
+        const trendOverride = 
+          (pending.consecutiveBuys >= 5 && momentumScore > 0) ||
+          (pending.consecutiveBuys >= 3 && avgImpact > 0.005 && pending.momentumIncreasing);
 
         // Strong trend = clustered buys with increasing impact
         const strongTrend = pending.consecutiveBuys >= 3 && avgImpact > 0.01;
 
         // ===== STATE MACHINE LOGIC (PRE-BUY) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... state=${pending.poolState} price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${pending.consecutiveBuys} momentum=${momentumScore.toFixed(1)} unstable=${isUnstable} dead=${isDeadToken}`);
+        console.log(`[Pool] ${mint.slice(0, 8)}... state=${pending.poolState} price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${pending.consecutiveBuys} momentum=${momentumScore.toFixed(1)} momInc=${pending.momentumIncreasing} dipsAbsorbed=${pending.dipsAbsorbed} unstable=${isUnstable} dead=${isDeadToken}`);
         
         switch (pending.poolState) {
           case PoolState.WATCH:
@@ -1152,12 +1202,18 @@ export class MeteoraDammV2CopyBot {
             if (isDeadToken) {
               pending.poolState = PoolState.AVOID;
               console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (dead token: no movement for ${pending.noMovementCount} intervals)`);
-            } else if (extremeDump || possibleLiquidityPull || isUnstable) {
+            } else if (extremeDump || possibleLiquidityPull) {
               pending.poolState = PoolState.AVOID;
               console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (dump=${(priceMovePct * 100).toFixed(1)}%)`);
+            } else if (trendOverride) {
+              // TREND OVERRIDE: Strong momentum overrides instability
+              pending.poolState = PoolState.ENTRY_READY;
+              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → ENTRY_READY (TREND OVERRIDE: consecBuys=${pending.consecutiveBuys} momentum=${momentumScore.toFixed(1)} increasing=${pending.momentumIncreasing})`);
+            } else if (isUnstable && !trendOverride) {
+              pending.poolState = PoolState.AVOID;
+              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (unstable without trend)`);
             } else if (
               (strongTrend || (buyPressure && quoteImpactPct > 0.03 && impactAccelerating)) &&
-              !isUnstable &&
               !weakTrend
             ) {
               pending.poolState = PoolState.ENTRY_READY;
@@ -1174,6 +1230,7 @@ export class MeteoraDammV2CopyBot {
             break;
 
           case PoolState.AVOID:
+            // Reset to WATCH if conditions improve
             if (!isUnstable && !isDeadToken && buyPressure && !weakTrend) {
               pending.poolState = PoolState.WATCH;
               // Reset counters
@@ -1186,6 +1243,11 @@ export class MeteoraDammV2CopyBot {
               pending.noMovementCount = 0;
               pending.impactHistory = [];
               pending.priceMoveHistory = [];
+              pending.momentumHistory = [];
+              pending.momentumScore = 0;
+              pending.momentumIncreasing = false;
+              pending.dipsAbsorbed = 0;
+              pending.lastDipRecovery = 0;
               console.log(`[Bot] Pool ${mint.slice(0, 8)}... → WATCH (reset)`);
             }
             break;
@@ -1233,6 +1295,41 @@ export class MeteoraDammV2CopyBot {
         }
         position.lastDirection = direction;
 
+        // ===== ENHANCED MOMENTUM TRACKING FOR EXITS =====
+        // Consecutive buys/sells
+        if (buyPressure) {
+          position.consecutiveBuys++;
+          position.consecutiveSells = 0;
+        } else if (sellPressure) {
+          position.consecutiveSells++;
+          position.consecutiveBuys = 0;
+        }
+
+        // Calculate momentum score
+        const momentumScore = position.consecutiveBuys * 2 - position.consecutiveSells * 1.5 - position.flipCount * 0.3;
+        
+        // Track momentum history
+        position.momentumHistory.push(momentumScore);
+        if (position.momentumHistory.length > 5) position.momentumHistory.shift();
+        
+        // Detect momentum direction
+        const prevMomentum = position.momentumHistory.length > 1 
+          ? position.momentumHistory[position.momentumHistory.length - 2] 
+          : 0;
+        position.momentumIncreasing = momentumScore > prevMomentum;
+        position.momentumScore = momentumScore;
+
+        // Dip absorption for exits
+        if (sellPressure && position.consecutiveBuys === 0) {
+          position.lastDipRecovery = -Math.abs(priceMovePct);
+        } else if (buyPressure && position.lastDipRecovery < 0) {
+          const recoveryStrength = priceMovePct - position.lastDipRecovery;
+          if (recoveryStrength > 0.01) {
+            position.dipsAbsorbed++;
+            position.lastDipRecovery = priceMovePct;
+          }
+        }
+
         // Weak trend detection
         if (buyPressure && position.lastDirection === "SELL") {
           position.weakTrendCounter++;
@@ -1261,12 +1358,15 @@ export class MeteoraDammV2CopyBot {
             position.highestProfit = profitPct;
           }
 
-          // ===== PROFIT EXIT LOGIC =====
-          // Exit when profit > target AND momentum slowing
-          const momentumSlowing = sellPressure || position.recoveryFails > 2 || position.sellTrendIncreasing;
+          // ===== IMPROVED PROFIT EXIT LOGIC =====
+          // Only exit when profit > target AND trend is breaking
+          const trendBreaking = 
+            position.consecutiveBuys === 0 && 
+            position.consecutiveSells >= 2 &&
+            !position.momentumIncreasing;
           
-          if (profitPct >= profitExitPercent && momentumSlowing) {
-            console.log(`[Bot] PROFIT EXIT: ${mint.slice(0, 8)}... (${profitPct.toFixed(1)}% profit, momentum slowing)`);
+          if (profitPct >= profitExitPercent && trendBreaking) {
+            console.log(`[Bot] PROFIT EXIT: ${mint.slice(0, 8)}... (${profitPct.toFixed(1)}% profit, trend breaking)`);
             await this.copySell(mint, "PROFIT_EXIT", 100);
             continue;
           }
@@ -1277,12 +1377,24 @@ export class MeteoraDammV2CopyBot {
         const possibleLiquidityPull =
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
-        const isUnstable = position.flipCount > 3;
-        const weakTrend = position.weakTrendCounter > 2;
-        const noRecovery = position.recoveryFails > 2;
+        
+        // ===== TREND BREAK DETECTION =====
+        // Trend is broken when:
+        // 1. consecBuys reset to 0 AND
+        // 2. momentum dropping AND  
+        // 3. no recovery after 3+ intervals
+        position.trendBroken = 
+          position.consecutiveBuys === 0 &&
+          !position.momentumIncreasing &&
+          position.recoveryFails > 3 &&
+          position.dipsAbsorbed === 0; // No dips absorbed = no buyers
+
+        const isUnstable = position.flipCount > 5 && !position.momentumIncreasing;
+        const weakTrend = position.weakTrendCounter > 2 && !position.momentumIncreasing;
+        const noRecovery = position.recoveryFails > 3;
 
         // ===== STATE MACHINE LOGIC (POST-BUY) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... state=${position.poolState} profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure}`);
+        console.log(`[Pool] ${mint.slice(0, 8)}... state=${position.poolState} profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} trendBroken=${position.trendBroken}`);
         
         switch (position.poolState) {
           case PoolState.WATCH:
@@ -1298,19 +1410,19 @@ export class MeteoraDammV2CopyBot {
             break;
 
           case PoolState.HOLD:
+            // HARD EXIT: Only for extreme events
             if (extremeDump || possibleLiquidityPull) {
               console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
               await this.copySell(mint, "HARD_EXIT", 100);
               position.poolState = PoolState.EXIT;
-            } else if (
-              sellPressure &&
-              quoteImpactPct > 0.02 &&
-              (position.sellTrendIncreasing || noRecovery || weakTrend)
-            ) {
-              console.log(`[Bot] SOFT EXIT: Weak structure for ${mint.slice(0, 8)}...`);
+            } 
+            // SOFT EXIT: Only when trend is definitively broken
+            else if (position.trendBroken) {
+              console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)})`);
               await this.copySell(mint, "SOFT_EXIT", 100);
               position.poolState = PoolState.EXIT;
             }
+            // Allow dips to recover - don't exit on single sell
             break;
 
           case PoolState.EXIT:
@@ -1438,6 +1550,15 @@ export class MeteoraDammV2CopyBot {
       lastSellMove: pending.lastSellMove,
       entryPrice: pending.prevPoolSnapshot?.price,
       highestProfit: 0,
+      // Enhanced momentum tracking - continue from pending
+      momentumScore: pending.momentumScore,
+      momentumHistory: pending.momentumHistory,
+      momentumIncreasing: pending.momentumIncreasing,
+      consecutiveBuys: pending.consecutiveBuys,
+      consecutiveSells: pending.consecutiveSells,
+      dipsAbsorbed: pending.dipsAbsorbed,
+      lastDipRecovery: pending.lastDipRecovery,
+      trendBroken: false,
     });
 
     console.log(
@@ -1571,6 +1692,12 @@ export class MeteoraDammV2CopyBot {
             impactHistory: [],
             lastPriceMove: 0,
             priceMoveHistory: [],
+            // Enhanced momentum tracking
+            momentumScore: 0,
+            momentumHistory: [],
+            momentumIncreasing: false,
+            dipsAbsorbed: 0,
+            lastDipRecovery: 0,
           });
           console.log(`[Bot] Created pending position for ${mint.slice(0, 8)}... - state machine evaluating...`);
         }
@@ -1756,6 +1883,15 @@ export class MeteoraDammV2CopyBot {
       lastSellMove: 0,
       entryPrice: undefined,
       highestProfit: 0,
+      // Enhanced momentum tracking
+      momentumScore: 0,
+      momentumHistory: [],
+      momentumIncreasing: false,
+      consecutiveBuys: 0,
+      consecutiveSells: 0,
+      dipsAbsorbed: 0,
+      lastDipRecovery: 0,
+      trendBroken: false,
     });
 
     console.log(
