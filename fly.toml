@@ -1,0 +1,15 @@
+app = "follower-bot-e3nkpg"
+primary_region = "fra"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+[processes]
+  app = "npm start"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024
