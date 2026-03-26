@@ -1045,7 +1045,7 @@ export class MeteoraDammV2CopyBot {
   }
 
   private async checkPool(): Promise<void> {
-    const profitExitPercent = this.config.profitExitPercent ?? 20;
+    const profitExitPercent = this.config.profitExitPercent ?? 10;
     const poolRpcUrl = this.config.poolRpcUrl ?? this.config.rpcUrl;
 
     // ===== PHASE 1: Monitor PENDING positions (state machine decides entry) =====
