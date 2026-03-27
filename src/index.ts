@@ -641,7 +641,9 @@ export class MeteoraDammV2CopyBot {
                 // Update wallet profile based on tx position
                 this.updateWalletProfile(buyerWallet, txIndex, mint);
                 
-                console.log(`[Wallet] 🟨 Found buyer: ${buyerWallet.slice(0, 8)}... (tx #${txIndex}, tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
+                if (tokenAccount) {
+                  console.log(`[Wallet] 🟨 Found buyer: ${buyerWallet.slice(0, 8)}... (tx #${txIndex}, tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
+                }
               }
               
               // Cache the token account for this mint
