@@ -56,8 +56,9 @@ type BotConfig = {
   poolCheckIntervalMs?: number; // How often to check pool state (default: 2s)
   profitExitPercent?: number; // Profit % to trigger exit when momentum slowing (default: 20%)
   // Early score engine params
-  leaderWallets?: string[]; // High-weight known wallets (score +8 each)
-  followerWallets?: string[]; // Lower-weight known wallets (score +3 each)
+  leaderWallets?: string[]; // High-weight known wallets (score +10 each)
+  followerWallets?: string[]; // Lower-weight known wallets (score +4 each)
+  insiderWallets?: string[]; // Known insider wallets (score +3 each)
 };
 
 type TokenDelta = {
@@ -522,6 +523,7 @@ export class MeteoraDammV2CopyBot {
   private readonly earlyMetricsMap = new Map<string, TokenEarlyMetrics>(); // mint -> metrics
   private readonly leaderWalletSet!: Set<string>;
   private readonly followerWalletSet!: Set<string>;
+  private readonly insiderWalletSet!: Set<string>;
   private readonly knownWalletSet!: Set<string>;
   
   // Dynamic wallet classification
@@ -566,9 +568,10 @@ export class MeteoraDammV2CopyBot {
     // Initialize known wallet sets for early score engine
     this.leaderWalletSet = new Set(config.leaderWallets ?? []);
     this.followerWalletSet = new Set(config.followerWallets ?? []);
-    this.knownWalletSet = new Set([...this.leaderWalletSet, ...this.followerWalletSet]);
+    this.insiderWalletSet = new Set(config.insiderWallets ?? []);
+    this.knownWalletSet = new Set([...this.leaderWalletSet, ...this.followerWalletSet, ...this.insiderWalletSet]);
     
-    console.log(`[Bot] Loaded ${this.leaderWalletSet.size} LEADER wallets and ${this.followerWalletSet.size} FOLLOWER wallets`);
+    console.log(`[Bot] Loaded ${this.leaderWalletSet.size} LEADER, ${this.followerWalletSet.size} FOLLOWER, ${this.insiderWalletSet.size} INSIDER wallets`);
   }
 
   // ===== EARLY SCORE ENGINE HELPER FUNCTIONS =====
@@ -753,6 +756,9 @@ export class MeteoraDammV2CopyBot {
       } else if (this.followerWalletSet.has(tx.from)) {
         tracker.followerWalletHits += 1;
         tracker.knownWalletHits += 1;
+      } else if (this.insiderWalletSet.has(tx.from)) {
+        tracker.knownWalletHits += 1;
+        // Insider wallets contribute to knownWalletHits but not leader/follower specific counts
       }
     }
 
@@ -811,16 +817,18 @@ export class MeteoraDammV2CopyBot {
     else score -= 15;
 
     // Known swarm presence (weighted)
-    // Leaders = +10 each (alpha signal), Followers = +4 each (swarm confirmation)
+    // Leaders = +10 each (alpha signal), Followers = +4 each (swarm confirmation), Insiders = +3 each
     const leaderBonus = tracker.leaderWalletHits * 10;
     const followerBonus = tracker.followerWalletHits * 4;
+    const insiderHits = tracker.knownWalletHits - tracker.leaderWalletHits - tracker.followerWalletHits;
+    const insiderBonus = insiderHits * 3;
     
     if (knownWalletRatio >= 0.5) score += 20;
     else if (knownWalletRatio >= 0.25) score += 10;
     else if (knownWalletRatio >= 0.10) score += 5;
     else score -= 10; // No known wallets = less confidence
     
-    score += leaderBonus + followerBonus;
+    score += leaderBonus + followerBonus + insiderBonus;
 
     // Repetition penalty
     if (repeatedWalletRatio > 0.3) score -= 10;
@@ -2408,6 +2416,7 @@ async function main() {
     // Early score engine wallets
     leaderWallets: process.env.LEADER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
     followerWallets: process.env.FOLLOWER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
+    insiderWallets: process.env.INSIDER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
   });
 
   await bot.start();
