@@ -604,26 +604,35 @@ export class MeteoraDammV2CopyBot {
 
   // ===== DYNAMIC WALLET CLASSIFICATION =====
   
-  // Get token account address for a mint + owner
+  // Get token account address for a mint + owner using RPC method
   private async getTokenAccount(mint: string, owner: string): Promise<string | null> {
     const cacheKey = `${mint}:${owner}`;
     const cached = this.tokenAccountCache.get(cacheKey);
     if (cached) return cached;
     
     try {
-      const url = `${HELIUS_BASE}/addresses/${owner}/balances?api-key=${this.heliusApiKey}`;
-      const resp = await fetch(url);
-      if (!resp.ok) return null;
+      // Use RPC method getTokenAccountsByOwner
+      const resp = await fetch(this.config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "1",
+          method: "getTokenAccountsByOwner",
+          params: [
+            owner,
+            { mint },
+            { encoding: "jsonParsed", commitment: "confirmed" }
+          ]
+        })
+      });
       
       const data = await resp.json() as any;
       
-      // Helius returns { tokens: [...] } or direct array depending on endpoint
-      const tokens = Array.isArray(data) ? data : (data.tokens ?? []);
-      const tokenAccount = tokens.find((b: any) => b.mint === mint);
-      
-      if (tokenAccount?.tokenAccount) {
-        this.tokenAccountCache.set(cacheKey, tokenAccount.tokenAccount);
-        return tokenAccount.tokenAccount;
+      if (data.result?.value?.length > 0) {
+        const tokenAccount = data.result.value[0].pubkey;
+        this.tokenAccountCache.set(cacheKey, tokenAccount);
+        return tokenAccount;
       }
       return null;
     } catch (err: any) {
@@ -726,49 +735,6 @@ export class MeteoraDammV2CopyBot {
         this.knownWalletSet.add(wallet);
         console.log(`[Wallet] 🟦 AUTO-CLASSIFIED AS FOLLOWER: ${wallet} (followerScore=${profile.followerScore}, tokensSeen=${profile.tokensSeen.size})`);
       }
-    }
-  }
-
-  // Batch get token accounts for multiple mints
-  private async batchGetTokenAccounts(mints: string[], owner: string): Promise<Map<string, string>> {
-    const result = new Map<string, string>();
-    
-    // Filter out cached ones first
-    const uncached: string[] = [];
-    for (const mint of mints) {
-      const cacheKey = `${mint}:${owner}`;
-      const cached = this.tokenAccountCache.get(cacheKey);
-      if (cached) {
-        result.set(mint, cached);
-      } else {
-        uncached.push(mint);
-      }
-    }
-    
-    if (uncached.length === 0) return result;
-    
-    try {
-      // Single API call for all balances
-      const url = `${HELIUS_BASE}/addresses/${owner}/balances?api-key=${this.heliusApiKey}`;
-      const resp = await fetch(url);
-      if (!resp.ok) return result;
-      
-      const data = await resp.json() as any;
-      const tokens = Array.isArray(data) ? data : (data.tokens ?? []);
-      
-      // Build lookup map
-      for (const token of tokens) {
-        if (token.mint && token.tokenAccount) {
-          const cacheKey = `${token.mint}:${owner}`;
-          this.tokenAccountCache.set(cacheKey, token.tokenAccount);
-          result.set(token.mint, token.tokenAccount);
-        }
-      }
-      
-      return result;
-    } catch (err: any) {
-      console.error(`[Wallet] Error batch getting token accounts: ${err.message}`);
-      return result;
     }
   }
 
