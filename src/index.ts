@@ -55,6 +55,9 @@ type BotConfig = {
   poolRpcUrl?: string; // Separate RPC for pool monitoring (avoid rate limits)
   poolCheckIntervalMs?: number; // How often to check pool state (default: 2s)
   profitExitPercent?: number; // Profit % to trigger exit when momentum slowing (default: 20%)
+  // Early score engine params
+  leaderWallets?: string[]; // High-weight known wallets (score +8 each)
+  followerWallets?: string[]; // Lower-weight known wallets (score +3 each)
 };
 
 type TokenDelta = {
@@ -94,14 +97,43 @@ type JupiterExecuteResponse = {
   txid?: string;
 };
 
-// Pool state machine
-enum PoolState {
-  AVOID = "AVOID",
-  WATCH = "WATCH",
-  ENTRY_READY = "ENTRY_READY",
-  HOLD = "HOLD",
-  EXIT = "EXIT",
-}
+// Early score engine types
+type TxSide = "buy" | "sell" | "unknown";
+
+type EarlyTx = {
+  signature: string;
+  ts: number;              // ms timestamp
+  from?: string;
+  side: TxSide;
+  amount?: number;         // normalized amount
+};
+
+type TokenEarlyMetrics = {
+  tokenMint: string;
+  poolAddress: string;
+  startedAt: number;
+
+  txs: EarlyTx[];
+  uniqueWallets: Set<string>;
+  knownWalletHits: number;
+  leaderWalletHits: number;
+  followerWalletHits: number;
+
+  buyCount: number;
+  sellCount: number;
+  unknownCount: number;
+
+  repeatedWalletCount: number;
+  walletSeenCount: Map<string, number>;
+
+  amounts: number[];
+  firstSellAtTx?: number;
+  firstSellAtMs?: number;
+
+  score: number;
+  decision: "good" | "bad" | "pending" | "none";
+  evaluated: boolean;
+};
 
 // Pool snapshot for monitoring
 type PoolSnapshot = {
@@ -118,29 +150,9 @@ type PendingPosition = {
   poolAddress: string;
   leaderBuySignature: string;
   slot: number;
-  poolState: PoolState;
   prevPoolSnapshot?: PoolSnapshot;
-  flipCount: number;
   lastDirection: "BUY" | "SELL" | "NONE";
-  weakTrendCounter: number;
-  recoveryFails: number;
-  sellTrendIncreasing: boolean;
-  lastSellMove: number;
-  detectedAt: number; // timestamp
-  // Momentum tracking
-  consecutiveBuys: number;
-  consecutiveSells: number;
-  noMovementCount: number;
-  lastImpact: number;
-  impactHistory: number[]; // last 5 impacts
   lastPriceMove: number;
-  priceMoveHistory: number[]; // last 5 price moves
-  // Enhanced momentum tracking
-  momentumScore: number; // Current momentum score
-  momentumHistory: number[]; // last 5 momentum scores
-  momentumIncreasing: boolean; // Is momentum increasing?
-  dipsAbsorbed: number; // Count of dips that were absorbed (sell followed by stronger buy)
-  lastDipRecovery: number; // Last dip recovery strength
 };
 
 type FollowState = {
@@ -160,14 +172,9 @@ type FollowState = {
   buyTxCount: number; // Count of buy txs (2074080 native transfer amount)
   // Pool monitoring state
   poolAddress?: string; // DAMM v2 pool address (extracted from migration tx)
-  poolState: PoolState; // State machine state
   prevPoolSnapshot?: PoolSnapshot; // Previous pool snapshot for comparison
   flipCount: number; // Direction flip counter
   lastDirection: "BUY" | "SELL" | "NONE"; // Last detected direction
-  weakTrendCounter: number; // Weak trend counter
-  recoveryFails: number; // Recovery fail counter
-  sellTrendIncreasing: boolean; // Is sell trend increasing?
-  lastSellMove: number; // Last sell price move
   entryPrice?: number; // Price at entry (from pool)
   highestProfit: number; // Highest profit % reached
   // Enhanced momentum tracking for exits
@@ -477,6 +484,13 @@ export class MeteoraDammV2CopyBot {
   private readonly attemptedBuys = new Set<string>();
   private readonly soldTokens = new Set<string>();
   private readonly mintToPoolMap = new Map<string, string>(); // mint -> pool address
+  
+  // Early score engine tracking
+  private readonly earlyMetricsMap = new Map<string, TokenEarlyMetrics>(); // mint -> metrics
+  private readonly leaderWalletSet!: Set<string>;
+  private readonly followerWalletSet!: Set<string>;
+  private readonly knownWalletSet!: Set<string>;
+  
   private started = false;
   private shouldStop = false;
   private reconnectAttempts = 0;
@@ -511,6 +525,140 @@ export class MeteoraDammV2CopyBot {
     const poolRpcUrl = config.poolRpcUrl ?? config.rpcUrl;
     const connection = new Connection(poolRpcUrl, "processed");
     this.cpAmm = new CpAmm(connection);
+    
+    // Initialize known wallet sets for early score engine
+    this.leaderWalletSet = new Set(config.leaderWallets ?? []);
+    this.followerWalletSet = new Set(config.followerWallets ?? []);
+    this.knownWalletSet = new Set([...this.leaderWalletSet, ...this.followerWalletSet]);
+  }
+
+  // ===== EARLY SCORE ENGINE HELPER FUNCTIONS =====
+  
+  private createEarlyMetrics(tokenMint: string, poolAddress: string): TokenEarlyMetrics {
+    return {
+      tokenMint,
+      poolAddress,
+      startedAt: Date.now(),
+      txs: [],
+      uniqueWallets: new Set(),
+      knownWalletHits: 0,
+      leaderWalletHits: 0,
+      followerWalletHits: 0,
+      buyCount: 0,
+      sellCount: 0,
+      unknownCount: 0,
+      repeatedWalletCount: 0,
+      walletSeenCount: new Map(),
+      amounts: [],
+      score: 0,
+      decision: "none",
+      evaluated: false,
+    };
+  }
+
+  private updateEarlyMetrics(tracker: TokenEarlyMetrics, tx: EarlyTx): void {
+    tracker.txs.push(tx);
+
+    // Track wallet
+    if (tx.from) {
+      const prev = tracker.walletSeenCount.get(tx.from) ?? 0;
+      tracker.walletSeenCount.set(tx.from, prev + 1);
+
+      if (prev === 0) {
+        tracker.uniqueWallets.add(tx.from);
+      } else if (prev === 1) {
+        tracker.repeatedWalletCount += 1;
+      }
+
+      // Check known wallets with weights
+      if (this.leaderWalletSet.has(tx.from)) {
+        tracker.leaderWalletHits += 1;
+        tracker.knownWalletHits += 1;
+      } else if (this.followerWalletSet.has(tx.from)) {
+        tracker.followerWalletHits += 1;
+        tracker.knownWalletHits += 1;
+      }
+    }
+
+    // Track buy/sell
+    if (tx.side === "buy") {
+      tracker.buyCount += 1;
+    } else if (tx.side === "sell") {
+      tracker.sellCount += 1;
+      if (tracker.firstSellAtTx === undefined) {
+        tracker.firstSellAtTx = tracker.txs.length;
+        tracker.firstSellAtMs = tx.ts - tracker.startedAt;
+      }
+    } else {
+      tracker.unknownCount += 1;
+    }
+
+    // Track amounts
+    if (typeof tx.amount === "number" && Number.isFinite(tx.amount)) {
+      tracker.amounts.push(tx.amount);
+    }
+  }
+
+  private scoreToken(tracker: TokenEarlyMetrics, now: number): number {
+    const elapsedMs = now - tracker.startedAt;
+    const txCount = tracker.txs.length;
+    const classified = tracker.buyCount + tracker.sellCount;
+
+    const txPerSecond = txCount / Math.max(elapsedMs / 1000, 1);
+    const uniqueWalletRatio = tracker.uniqueWallets.size / Math.max(txCount, 1);
+    const buyRatio = classified > 0 ? tracker.buyCount / classified : 0;
+    const knownWalletRatio = tracker.knownWalletHits / Math.max(txCount, 1);
+    const repeatedWalletRatio = tracker.repeatedWalletCount / Math.max(txCount, 1);
+
+    let score = 0;
+
+    // Speed (tx compression)
+    if (txPerSecond >= 3) score += 20;
+    else if (txPerSecond >= 1.5) score += 10;
+
+    // Diversity (unique wallets)
+    if (uniqueWalletRatio >= 0.8) score += 20;
+    else if (uniqueWalletRatio >= 0.65) score += 10;
+
+    // Buy pressure
+    if (buyRatio >= 0.95) score += 25;
+    else if (buyRatio >= 0.85) score += 10;
+
+    // Known swarm presence (weighted)
+    const leaderBonus = tracker.leaderWalletHits * 8;
+    const followerBonus = tracker.followerWalletHits * 3;
+    if (knownWalletRatio >= 0.5) score += 25;
+    else if (knownWalletRatio >= 0.25) score += 10;
+    score += leaderBonus + followerBonus;
+
+    // Repetition penalty
+    if (repeatedWalletRatio > 0.3) score -= 10;
+
+    // Early sell penalty
+    if (tracker.firstSellAtTx !== undefined && tracker.firstSellAtTx <= 50) {
+      score -= 25;
+    }
+
+    return score;
+  }
+
+  private classifyEarlyToken(score: number): "good" | "bad" | "pending" {
+    if (score >= 65) return "good";
+    if (score <= 25) return "bad";
+    return "pending";
+  }
+
+  private shouldEvaluateEarly(tracker: TokenEarlyMetrics, now: number): boolean {
+    const txCount = tracker.txs.length;
+    const elapsedMs = now - tracker.startedAt;
+
+    return (
+      txCount === 30 ||
+      txCount === 50 ||
+      txCount === 100 ||
+      txCount >= 200 ||
+      elapsedMs >= 60_000
+    );
   }
 
   async start(): Promise<void> {
@@ -982,6 +1130,15 @@ export class MeteoraDammV2CopyBot {
           // Check if it's a buy (amount around 2074080, with some tolerance)
           if (amount >= 2000000 && amount <= 2500000) {
             position.buyTxCount++;
+            
+            // Auto-collect known wallets from toUserAccount
+            const toUserAccount = tx.nativeTransfers[0].toUserAccount;
+            if (toUserAccount && !this.knownWalletSet.has(toUserAccount)) {
+              this.knownWalletSet.add(toUserAccount);
+              this.followerWalletSet.add(toUserAccount);
+              console.log(`[Bot] Auto-added known wallet: ${toUserAccount.slice(0, 8)}... (from buy tx #${position.buyTxCount})`);
+            }
+            
             console.log(`[Bot] Token Account SL: Buy tx #${position.buyTxCount} detected for ${position.mint.slice(0, 8)}...`);
           }
         }
@@ -1050,8 +1207,9 @@ export class MeteoraDammV2CopyBot {
   private async checkPool(): Promise<void> {
     const profitExitPercent = this.config.profitExitPercent ?? 1;
     const poolRpcUrl = this.config.poolRpcUrl ?? this.config.rpcUrl;
+    const now = Date.now();
 
-    // ===== PHASE 1: Monitor PENDING positions (state machine decides entry) =====
+    // ===== PHASE 1: EARLY SCORE ENGINE FOR PENDING POSITIONS =====
     for (const [mint, pending] of this.pendingPositions) {
       try {
         // Get real pool state from CpAmm SDK
@@ -1076,184 +1234,69 @@ export class MeteoraDammV2CopyBot {
 
         // Direction tracking
         const direction: "BUY" | "SELL" | "NONE" = buyPressure ? "BUY" : sellPressure ? "SELL" : "NONE";
-
-        if (direction !== pending.lastDirection && pending.lastDirection !== "NONE") {
-          pending.flipCount++;
-        }
         pending.lastDirection = direction;
 
-        // ===== MOMENTUM TRACKING =====
-        // Consecutive buys/sells
-        if (buyPressure) {
-          pending.consecutiveBuys++;
-          pending.consecutiveSells = 0;
-        } else if (sellPressure) {
-          pending.consecutiveSells++;
-          pending.consecutiveBuys = 0;
+        // ===== EARLY SCORE ENGINE: Get or create tracker =====
+        let tracker = this.earlyMetricsMap.get(mint);
+        if (!tracker) {
+          tracker = this.createEarlyMetrics(mint, pending.poolAddress);
+          this.earlyMetricsMap.set(mint, tracker);
         }
 
-        // Dead token detection (no movement)
-        if (quoteImpactPct < 0.001 && Math.abs(priceMovePct) < 0.001) {
-          pending.noMovementCount++;
-        } else {
-          pending.noMovementCount = 0;
-        }
+        // ===== EARLY SCORE ENGINE: Update with each pool check as a "tx" =====
+        // Each pool check interval = one tx event
+        const earlyTx: EarlyTx = {
+          signature: `${mint}-${tracker.txs.length}`,
+          ts: now,
+          from: undefined, // We don't have wallet info from pool checks
+          side: buyPressure ? "buy" : sellPressure ? "sell" : "unknown",
+          amount: Math.abs(dQuote), // Use quote change as amount proxy
+        };
+        this.updateEarlyMetrics(tracker, earlyTx);
 
-        // Impact history for averaging
-        pending.impactHistory.push(quoteImpactPct);
-        if (pending.impactHistory.length > 5) pending.impactHistory.shift();
-        const avgImpact = pending.impactHistory.reduce((a, b) => a + b, 0) / pending.impactHistory.length;
+        // ===== EARLY SCORE ENGINE: Evaluate at staged points =====
+        if (this.shouldEvaluateEarly(tracker, now) && !tracker.evaluated) {
+          const score = this.scoreToken(tracker, now);
+          tracker.score = score;
+          tracker.decision = this.classifyEarlyToken(score);
+          
+          const elapsedSec = Math.round((now - tracker.startedAt) / 1000);
+          const txPerSec = (tracker.txs.length / Math.max(elapsedSec, 1)).toFixed(1);
+          const uniqueRatio = (tracker.uniqueWallets.size / Math.max(tracker.txs.length, 1)).toFixed(2);
+          const buyRatio = tracker.buyCount + tracker.sellCount > 0 
+            ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
+            : "0.00";
+          
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision}`);
 
-        // Price move history
-        pending.priceMoveHistory.push(priceMovePct);
-        if (pending.priceMoveHistory.length > 5) pending.priceMoveHistory.shift();
-
-        // Impact acceleration (is impact increasing?)
-        const impactAccelerating = pending.lastImpact > 0 && quoteImpactPct > pending.lastImpact;
-        pending.lastImpact = quoteImpactPct;
-
-        // Price recovery detection (dip followed by strong rebound)
-        const hasRecovery = pending.priceMoveHistory.length >= 3 &&
-          pending.priceMoveHistory.slice(-3).some(m => m < -0.01) && // had a dip
-          priceMovePct > 0.02; // now recovering strongly
-
-        // Weak trend detection
-        if (buyPressure && pending.lastDirection === "SELL") {
-          pending.weakTrendCounter++;
-        }
-
-        // Sell trend strength
-        if (sellPressure) {
-          if (Math.abs(priceMovePct) > Math.abs(pending.lastSellMove)) {
-            pending.sellTrendIncreasing = true;
-          }
-          pending.lastSellMove = priceMovePct;
-        }
-
-        // No recovery check
-        if (priceMovePct < 0) {
-          pending.recoveryFails++;
-        } else {
-          pending.recoveryFails = 0;
-        }
-
-        // ===== MOMENTUM SCORE =====
-        const momentumScore =
-          pending.consecutiveBuys * 2 +
-          avgImpact * 100 -
-          pending.flipCount * 0.5;
-
-        // ===== ENHANCED MOMENTUM TRACKING =====
-        // Track momentum history
-        pending.momentumHistory.push(momentumScore);
-        if (pending.momentumHistory.length > 5) pending.momentumHistory.shift();
-        
-        // Detect momentum increasing (comparing to previous)
-        const prevMomentum = pending.momentumHistory.length > 1 
-          ? pending.momentumHistory[pending.momentumHistory.length - 2] 
-          : 0;
-        pending.momentumIncreasing = momentumScore > prevMomentum && momentumScore > 0;
-        pending.momentumScore = momentumScore;
-
-        // Dip absorption detection (sell followed by stronger buy)
-        if (sellPressure && pending.consecutiveBuys === 0) {
-          // Just saw a sell, mark potential dip
-          pending.lastDipRecovery = -Math.abs(priceMovePct);
-        } else if (buyPressure && pending.lastDipRecovery < 0) {
-          // Buy after a dip - check if it absorbed the dip
-          const recoveryStrength = priceMovePct - pending.lastDipRecovery;
-          if (recoveryStrength > 0.01) { // Recovery stronger than dip
-            pending.dipsAbsorbed++;
-            pending.lastDipRecovery = priceMovePct;
+          // ===== DECISION FLOW =====
+          if (tracker.decision === "good" && tracker.txs.length >= 30) {
+            // GOOD: Trigger buy
+            console.log(`[Bot] 🟢 EARLY BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
+            this.pendingPositions.delete(mint);
+            this.attemptedBuys.add(mint);
+            await this.copyBuyFromPending(pending);
+            continue;
+          } else if (tracker.decision === "bad") {
+            // BAD: Stop tracking
+            console.log(`[Bot] 🔴 EARLY REJECT: ${mint.slice(0, 8)}... (score=${score})`);
+            tracker.evaluated = true;
+          } else if (tracker.txs.length >= 200 || elapsedSec >= 60) {
+            // TIMEOUT: Stop tracking
+            console.log(`[Bot] ⏸️ EARLY TIMEOUT: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
+            tracker.evaluated = true;
           }
         }
 
-        // ===== EXTREME EVENTS =====
+        // Extreme events - immediate reject
         const extremeDump = priceMovePct < -0.5 || quoteImpactPct > 0.3;
         const possibleLiquidityPull =
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
-        
-        // ===== FIXED UNSTABLE DETECTION =====
-        // Unstable only if lots of flips AND NO strong trend forming
-        // Strong trend (consecBuys >= 3) OVERRIDES instability
-        const hasStrongTrend = pending.consecutiveBuys >= 3;
-        const hasMomentum = momentumScore > 0 && pending.momentumIncreasing;
-        const isUnstable = pending.flipCount > 5 && avgImpact < 0.02 && !hasStrongTrend && !hasMomentum;
-        
-        // Dead token - no movement for 10+ intervals
-        const isDeadToken = pending.noMovementCount >= 10;
-        
-        const weakTrend = pending.weakTrendCounter > 2 && !hasMomentum;
-        const noRecovery = pending.recoveryFails > 3;
 
-        // ===== TREND OVERRIDE CONDITIONS =====
-        // Even if unstable, allow entry if strong momentum is building
-        const trendOverride = 
-          (pending.consecutiveBuys >= 5 && momentumScore > 0) ||
-          (pending.consecutiveBuys >= 3 && avgImpact > 0.005 && pending.momentumIncreasing);
-
-        // Strong trend = clustered buys with increasing impact
-        const strongTrend = pending.consecutiveBuys >= 3 && avgImpact > 0.01;
-
-        // ===== STATE MACHINE LOGIC (PRE-BUY) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... state=${pending.poolState} price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${pending.consecutiveBuys} momentum=${momentumScore.toFixed(1)} momInc=${pending.momentumIncreasing} dipsAbsorbed=${pending.dipsAbsorbed} unstable=${isUnstable} dead=${isDeadToken}`);
-        
-        switch (pending.poolState) {
-          case PoolState.WATCH:
-            // Entry conditions - need momentum building, not just single buy
-            if (isDeadToken) {
-              pending.poolState = PoolState.AVOID;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (dead token: no movement for ${pending.noMovementCount} intervals)`);
-            } else if (extremeDump || possibleLiquidityPull) {
-              pending.poolState = PoolState.AVOID;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (dump=${(priceMovePct * 100).toFixed(1)}%)`);
-            } else if (trendOverride) {
-              // TREND OVERRIDE: Strong momentum overrides instability
-              pending.poolState = PoolState.ENTRY_READY;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → ENTRY_READY (TREND OVERRIDE: consecBuys=${pending.consecutiveBuys} momentum=${momentumScore.toFixed(1)} increasing=${pending.momentumIncreasing})`);
-            } else if (isUnstable && !trendOverride) {
-              pending.poolState = PoolState.AVOID;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID (unstable without trend)`);
-            } else if (
-              (strongTrend || (buyPressure && quoteImpactPct > 0.03 && impactAccelerating)) &&
-              !weakTrend
-            ) {
-              pending.poolState = PoolState.ENTRY_READY;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → ENTRY_READY (momentum: consecBuys=${pending.consecutiveBuys} impact=${(avgImpact * 100).toFixed(1)}% accelerating=${impactAccelerating})`);
-            }
-            break;
-
-          case PoolState.ENTRY_READY:
-            // TRIGGER BUY!
-            console.log(`[Bot] 🟢 ENTRY VERDICT: Buying ${mint.slice(0, 8)}... (momentumScore=${momentumScore.toFixed(1)})`);
-            this.pendingPositions.delete(mint);
-            this.attemptedBuys.add(mint);
-            await this.copyBuyFromPending(pending);
-            break;
-
-          case PoolState.AVOID:
-            // Reset to WATCH if conditions improve
-            if (!isUnstable && !isDeadToken && buyPressure && !weakTrend) {
-              pending.poolState = PoolState.WATCH;
-              // Reset counters
-              pending.flipCount = 0;
-              pending.weakTrendCounter = 0;
-              pending.recoveryFails = 0;
-              pending.sellTrendIncreasing = false;
-              pending.consecutiveBuys = 0;
-              pending.consecutiveSells = 0;
-              pending.noMovementCount = 0;
-              pending.impactHistory = [];
-              pending.priceMoveHistory = [];
-              pending.momentumHistory = [];
-              pending.momentumScore = 0;
-              pending.momentumIncreasing = false;
-              pending.dipsAbsorbed = 0;
-              pending.lastDipRecovery = 0;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → WATCH (reset)`);
-            }
-            break;
+        if (extremeDump || possibleLiquidityPull) {
+          console.log(`[Bot] Pool ${mint.slice(0, 8)}... → REJECT (dump=${(priceMovePct * 100).toFixed(1)}%)`);
+          if (tracker) tracker.evaluated = true;
         }
 
         pending.prevPoolSnapshot = snapshot;
@@ -1341,26 +1384,6 @@ export class MeteoraDammV2CopyBot {
           }
         }
 
-        // Weak trend detection
-        if (buyPressure && position.lastDirection === "SELL") {
-          position.weakTrendCounter++;
-        }
-
-        // Sell trend strength
-        if (sellPressure) {
-          if (Math.abs(priceMovePct) > Math.abs(position.lastSellMove)) {
-            position.sellTrendIncreasing = true;
-          }
-          position.lastSellMove = priceMovePct;
-        }
-
-        // No recovery check
-        if (priceMovePct < 0) {
-          position.recoveryFails++;
-        } else {
-          position.recoveryFails = 0;
-        }
-
         // Calculate profit
         if (position.entryPrice && position.entryPrice > 0) {
           const profitPct = ((snapshot.price - position.entryPrice) / position.entryPrice) * 100;
@@ -1369,8 +1392,8 @@ export class MeteoraDammV2CopyBot {
             position.highestProfit = profitPct;
           }
 
-          // ===== IMPROVED PROFIT EXIT LOGIC =====
-          // Only exit when profit > target AND trend is breaking
+          // ===== PROFIT EXIT LOGIC =====
+          // Exit when profit > target AND trend is breaking
           const trendBreaking = 
             position.consecutiveBuys === 0 && 
             position.consecutiveSells >= 2 &&
@@ -1395,99 +1418,50 @@ export class MeteoraDammV2CopyBot {
         const earlyPullback = 
           position.intervalsSinceEntry < 5 &&
           position.consecutiveSells === 1 &&
-          position.momentumScore > -4;
+          momentumScore > -4;
 
         // Strong trend override: if we had strong momentum (>5), ignore first sell
         const strongTrendOverride = 
           position.peakMomentum > 5 &&
           position.consecutiveSells === 1 &&
-          position.momentumScore > -4;
+          momentumScore > -4;
 
-        // ===== FIXED TREND BREAK DETECTION =====
+        // ===== TREND BREAK DETECTION =====
         // Only trend broken when confirmed weakness (not just single sell)
         position.trendBroken = 
-          (position.consecutiveSells >= 2 && position.momentumScore <= -4) ||
-          position.momentumScore <= -6;
+          (position.consecutiveSells >= 2 && momentumScore <= -4) ||
+          momentumScore <= -6;
 
-        // ===== FIXED DANGER EXIT CONDITIONS =====
+        // ===== DANGER EXIT CONDITIONS =====
         // Require BOTH consecutive sells AND negative momentum
-        // NOT just sellPressure alone
         const dangerExit =
-          (position.consecutiveSells >= 2 && position.momentumScore <= -4) ||
-          position.momentumScore <= -6;
+          (position.consecutiveSells >= 2 && momentumScore <= -4) ||
+          momentumScore <= -6;
 
         // Check if last bounce was weak (buy followed by immediate sell)
-        const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && position.momentumScore < 0;
+        const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && momentumScore < 0;
 
-        const isUnstable = position.flipCount > 5 && !position.momentumIncreasing;
-        const weakTrend = position.weakTrendCounter > 2 && !position.momentumIncreasing;
-        const noRecovery = position.recoveryFails > 3;
-
-        // ===== STATE MACHINE LOGIC (POST-BUY) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... state=${position.poolState} profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit}`);
+        // ===== EXIT LOGIC (NO STATE MACHINE) =====
+        console.log(`[Pool] ${mint.slice(0, 8)}... profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit}`);
         
-        switch (position.poolState) {
-          case PoolState.WATCH:
-            if (buyPressure && quoteImpactPct > 0.03 && !isUnstable) {
-              position.poolState = PoolState.ENTRY_READY;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → ENTRY_READY`);
-            }
-            break;
-
-          case PoolState.ENTRY_READY:
-            position.poolState = PoolState.HOLD;
-            console.log(`[Bot] Pool ${mint.slice(0, 8)}... → HOLD`);
-            break;
-
-          case PoolState.HOLD:
-            // Skip exits during early pullback (first 5 intervals)
-            if (earlyPullback) {
-              console.log(`[Bot] HOLD: Early pullback for ${mint.slice(0, 8)}... ignoring (interval=${position.intervalsSinceEntry})`);
-              break;
-            }
-            
-            // Skip exits if strong trend override (had momentum > 5)
-            if (strongTrendOverride) {
-              console.log(`[Bot] HOLD: Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
-              break;
-            }
-            
-            // HARD EXIT: Only for extreme events (rug already happened)
-            if (extremeDump || possibleLiquidityPull) {
-              console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
-              await this.copySell(mint, "HARD_EXIT", 100);
-              position.poolState = PoolState.EXIT;
-            } 
-            // STRUCTURE EXIT: Exit during warning phase (before collapse)
-            else if (dangerExit) {
-              console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
-              await this.copySell(mint, "STRUCTURE_EXIT", 100);
-              position.poolState = PoolState.EXIT;
-            }
-            // SOFT EXIT: Trend definitively broken (fallback)
-            else if (position.trendBroken) {
-              console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)})`);
-              await this.copySell(mint, "SOFT_EXIT", 100);
-              position.poolState = PoolState.EXIT;
-            }
-            break;
-
-          case PoolState.EXIT:
-            position.poolState = PoolState.AVOID;
-            console.log(`[Bot] Pool ${mint.slice(0, 8)}... → AVOID`);
-            break;
-
-          case PoolState.AVOID:
-            if (!isUnstable && buyPressure) {
-              position.poolState = PoolState.WATCH;
-              // Reset counters
-              position.flipCount = 0;
-              position.weakTrendCounter = 0;
-              position.recoveryFails = 0;
-              position.sellTrendIncreasing = false;
-              console.log(`[Bot] Pool ${mint.slice(0, 8)}... → WATCH (reset)`);
-            }
-            break;
+        // Skip exits during early pullback (first 5 intervals)
+        if (earlyPullback) {
+          console.log(`[Bot] Early pullback for ${mint.slice(0, 8)}... ignoring (interval=${position.intervalsSinceEntry})`);
+        } else if (strongTrendOverride) {
+          // Skip exits if strong trend override (had momentum > 5)
+          console.log(`[Bot] Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
+        } else if (extremeDump || possibleLiquidityPull) {
+          // HARD EXIT: Only for extreme events (rug already happened)
+          console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
+          await this.copySell(mint, "HARD_EXIT", 100);
+        } else if (dangerExit) {
+          // STRUCTURE EXIT: Exit during warning phase (before collapse)
+          console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
+          await this.copySell(mint, "STRUCTURE_EXIT", 100);
+        } else if (position.trendBroken) {
+          // SOFT EXIT: Trend definitively broken (fallback)
+          console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)})`);
+          await this.copySell(mint, "SOFT_EXIT", 100);
         }
 
         position.prevPoolSnapshot = snapshot;
@@ -1587,28 +1561,23 @@ export class MeteoraDammV2CopyBot {
       buyTxCount: 0,
       // Pool monitoring state - continue from pending
       poolAddress: pending.poolAddress,
-      poolState: PoolState.HOLD, // Already in position, start in HOLD
       prevPoolSnapshot: pending.prevPoolSnapshot,
-      flipCount: pending.flipCount,
+      flipCount: 0,
       lastDirection: pending.lastDirection,
-      weakTrendCounter: pending.weakTrendCounter,
-      recoveryFails: pending.recoveryFails,
-      sellTrendIncreasing: pending.sellTrendIncreasing,
-      lastSellMove: pending.lastSellMove,
       entryPrice: pending.prevPoolSnapshot?.price,
       highestProfit: 0,
-      // Enhanced momentum tracking - continue from pending
-      momentumScore: pending.momentumScore,
-      momentumHistory: pending.momentumHistory,
-      momentumIncreasing: pending.momentumIncreasing,
-      consecutiveBuys: pending.consecutiveBuys,
-      consecutiveSells: pending.consecutiveSells,
-      dipsAbsorbed: pending.dipsAbsorbed,
-      lastDipRecovery: pending.lastDipRecovery,
+      // Enhanced momentum tracking
+      momentumScore: 0,
+      momentumHistory: [],
+      momentumIncreasing: false,
+      consecutiveBuys: 0,
+      consecutiveSells: 0,
+      dipsAbsorbed: 0,
+      lastDipRecovery: 0,
       trendBroken: false,
       // Breakout protection
       intervalsSinceEntry: 0,
-      peakMomentum: pending.momentumScore,
+      peakMomentum: 0,
     });
 
     console.log(
@@ -1726,30 +1695,10 @@ export class MeteoraDammV2CopyBot {
             poolAddress,
             leaderBuySignature: signature,
             slot: tx.slot ?? 0,
-            poolState: PoolState.WATCH,
-            flipCount: 0,
             lastDirection: "NONE",
-            weakTrendCounter: 0,
-            recoveryFails: 0,
-            sellTrendIncreasing: false,
-            lastSellMove: 0,
-            detectedAt: Date.now(),
-            // Momentum tracking
-            consecutiveBuys: 0,
-            consecutiveSells: 0,
-            noMovementCount: 0,
-            lastImpact: 0,
-            impactHistory: [],
             lastPriceMove: 0,
-            priceMoveHistory: [],
-            // Enhanced momentum tracking
-            momentumScore: 0,
-            momentumHistory: [],
-            momentumIncreasing: false,
-            dipsAbsorbed: 0,
-            lastDipRecovery: 0,
           });
-          console.log(`[Bot] Created pending position for ${mint.slice(0, 8)}... - state machine evaluating...`);
+          console.log(`[Bot] Created pending position for ${mint.slice(0, 8)}... - early score engine evaluating...`);
         }
       }
       return;
@@ -1923,14 +1872,9 @@ export class MeteoraDammV2CopyBot {
       buyTxCount: 0, // Count of buy txs in leader's token account
       // Pool monitoring state
       poolAddress: this.mintToPoolMap.get(signal.mint), // Get pool address from migration tx
-      poolState: PoolState.WATCH, // Start in WATCH state
       prevPoolSnapshot: undefined,
       flipCount: 0,
       lastDirection: "NONE",
-      weakTrendCounter: 0,
-      recoveryFails: 0,
-      sellTrendIncreasing: false,
-      lastSellMove: 0,
       entryPrice: undefined,
       highestProfit: 0,
       // Enhanced momentum tracking
@@ -2078,6 +2022,9 @@ async function main() {
     poolRpcUrl: process.env.POOL_RPC_URL,
     poolCheckIntervalMs: Number(process.env.POOL_CHECK_INTERVAL_MS ?? "2000"),
     profitExitPercent: Number(process.env.PROFIT_EXIT_PERCENT ?? "1"),
+    // Early score engine wallets
+    leaderWallets: process.env.LEADER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
+    followerWallets: process.env.FOLLOWER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
   });
 
   await bot.start();
