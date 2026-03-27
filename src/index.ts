@@ -130,6 +130,9 @@ type TokenEarlyMetrics = {
 
   repeatedWalletCount: number;
   walletSeenCount: Map<string, number>;
+  seenSignatures: Set<string>; // Deduplication - signatures already processed
+  rawFetchedCount: number; // Total fetched from API
+  duplicateCount: number; // Duplicates skipped
 
   amounts: number[];
   firstSellAtTx?: number;
@@ -593,6 +596,9 @@ export class MeteoraDammV2CopyBot {
       unknownCount: 0,
       repeatedWalletCount: 0,
       walletSeenCount: new Map(),
+      seenSignatures: new Set(),
+      rawFetchedCount: 0,
+      duplicateCount: 0,
       amounts: [],
       score: 0,
       decision: "none",
@@ -1467,11 +1473,17 @@ export class MeteoraDammV2CopyBot {
   }
 
   // Fetch transactions for a pool with wallet addresses
-  private async fetchPoolTransactions(poolAddress: string, skipCount: number): Promise<PoolTx[]> {
+  // Uses cursor-based paging with 'before' parameter to avoid re-fetching
+  private async fetchPoolTransactions(poolAddress: string, beforeSignature?: string): Promise<PoolTx[]> {
     try {
       const url = new URL(`${HELIUS_BASE}/addresses/${poolAddress}/transactions`);
       url.searchParams.set("api-key", this.heliusApiKey);
       url.searchParams.set("limit", "50");
+      
+      // Use 'before' cursor for pagination - fetches txs older than this signature
+      if (beforeSignature) {
+        url.searchParams.set("before", beforeSignature);
+      }
       
       const resp = await fetch(url.toString());
       if (!resp.ok) return [];
@@ -1480,37 +1492,89 @@ export class MeteoraDammV2CopyBot {
       const result: PoolTx[] = [];
       
       for (const tx of txs) {
-        // Skip already processed
-        if (skipCount > 0) {
-          skipCount--;
-          continue;
-        }
-        
-        // Determine side from tokenTransfers
+        // Determine side from multiple signals
         let side: "buy" | "sell" | "unknown" = "unknown";
         let amount = 0;
         let wallet: string | undefined;
         
+        // Method 1: Check tokenTransfers for swap direction
         if (tx.tokenTransfers && tx.tokenTransfers.length >= 2) {
           const first = tx.tokenTransfers[0];
           const second = tx.tokenTransfers[1];
           
           if (first.mint === SOL_MINT) {
-            // SOL out = BUY
+            // SOL out = BUY (user swapping SOL for token)
             side = "buy";
             amount = first.tokenAmount || 0;
             wallet = first.fromUserAccount;
           } else if (second.mint === SOL_MINT) {
-            // SOL in = SELL
+            // SOL in = SELL (user swapping token for SOL)
             side = "sell";
             amount = second.tokenAmount || 0;
             wallet = first.fromUserAccount;
           }
         }
         
-        // Also check nativeTransfers for wallet
+        // Method 2: Check nativeTransfers for SOL flow direction
+        if (side === "unknown" && tx.nativeTransfers && tx.nativeTransfers.length > 0) {
+          // Look for SOL transfers (amount > 0, native transfers are always SOL)
+          for (const transfer of tx.nativeTransfers) {
+            // Skip tiny amounts (likely fees)
+            if (transfer.amount < 10000) continue;
+            
+            wallet = transfer.fromUserAccount;
+            
+            // If SOL is going TO the pool, it's a buy
+            if (transfer.toUserAccount === poolAddress) {
+              side = "buy";
+              amount = transfer.amount;
+              break;
+            }
+            // If SOL is coming FROM the pool, it's a sell
+            if (transfer.fromUserAccount === poolAddress) {
+              side = "sell";
+              amount = transfer.amount;
+              break;
+            }
+          }
+        }
+        
+        // Method 3: Check accountData for token balance changes
+        if (side === "unknown" && tx.accountData && tx.accountData.length >= 2) {
+          // Look for token balance changes in the pool's token account
+          for (const acc of tx.accountData) {
+            if (acc.tokenBalanceChanges && acc.tokenBalanceChanges.length > 0) {
+              for (const change of acc.tokenBalanceChanges) {
+                // Positive token balance change = tokens added to account = SELL
+                // Negative token balance change = tokens removed = BUY
+                const rawAmount = change.rawTokenAmount?.tokenAmount;
+                if (rawAmount) {
+                  const tokenChange = BigInt(rawAmount);
+                  if (tokenChange > 0n) {
+                    // Tokens added to pool = someone sold
+                    side = "sell";
+                    amount = Math.abs(Number(tokenChange));
+                    wallet = acc.account;
+                  } else if (tokenChange < 0n) {
+                    // Tokens removed from pool = someone bought
+                    side = "buy";
+                    amount = Math.abs(Number(tokenChange));
+                    wallet = acc.account;
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        // Also check nativeTransfers for wallet if not found
         if (!wallet && tx.nativeTransfers && tx.nativeTransfers.length > 0) {
           wallet = tx.nativeTransfers[0].fromUserAccount;
+        }
+        
+        // Fallback: use feePayer as wallet
+        if (!wallet && tx.feePayer) {
+          wallet = tx.feePayer;
         }
         
         result.push({
@@ -1578,11 +1642,23 @@ export class MeteoraDammV2CopyBot {
         // ===== FETCH REAL TRANSACTIONS FROM POOL =====
         // Get actual txs with wallet addresses, not just pool snapshots
         if (!tracker.evaluated && tracker.txs.length < 200) {
-          const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, tracker.txs.length);
+          const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
           
-          console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs for ${mint.slice(0, 8)}... (total tracked: ${tracker.txs.length})`);
+          // Track raw fetch and deduplication
+          tracker.rawFetchedCount += poolTxs.length;
+          let newTxs = 0;
+          let dupTxs = 0;
           
           for (const poolTx of poolTxs) {
+            // DEDUPLICATE by signature
+            if (tracker.seenSignatures.has(poolTx.signature)) {
+              dupTxs++;
+              tracker.duplicateCount++;
+              continue;
+            }
+            tracker.seenSignatures.add(poolTx.signature);
+            newTxs++;
+            
             const earlyTx: EarlyTx = {
               signature: poolTx.signature,
               ts: poolTx.timestamp * 1000,
@@ -1614,6 +1690,13 @@ export class MeteoraDammV2CopyBot {
               console.log(`[EarlyScore] ⚠️ NO WALLET for tx ${poolTx.signature.slice(0, 8)}... (side=${poolTx.side})`);
             }
           }
+          
+          // Log fetch summary with dedup info
+          if (poolTxs.length > 0) {
+            console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs: ${newTxs} new, ${dupTxs} dup skipped (total tracked: ${tracker.txs.length}, raw: ${tracker.rawFetchedCount}, dups: ${tracker.duplicateCount})`);
+          } else {
+            console.log(`[EarlyScore] 📋 Fetched 0 txs for ${mint.slice(0, 8)}... (total tracked: ${tracker.txs.length})`);
+          }
         }
 
         // ===== EARLY SCORE ENGINE: Evaluate at staged points =====
@@ -1629,7 +1712,7 @@ export class MeteoraDammV2CopyBot {
             ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
             : "0.00";
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision} stage=${tracker.stage}`);
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} (raw=${tracker.rawFetchedCount}, dups=${tracker.duplicateCount}) tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision} stage=${tracker.stage}`);
 
           // ===== STAGE 1: Early Structure Decision =====
           if (tracker.stage === 1) {
