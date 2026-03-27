@@ -166,6 +166,17 @@ type PoolTx = {
   amount: number;
 };
 
+// Wallet profile for dynamic classification
+type WalletProfile = {
+  address: string;
+  leaderScore: number;      // +2 for each early appearance (tx <= 15)
+  followerScore: number;    // +1 for each mid appearance (tx 15-100)
+  earlyAppearances: number; // Count of appearances in first 15 txs
+  totalAppearances: number; // Total appearances across all tokens
+  tokensSeen: Set<string>;  // Which tokens this wallet appeared in
+  lastSeenAt: number;       // Timestamp of last appearance
+};
+
 // Pending position - migration detected but not yet bought
 type PendingPosition = {
   mint: string;
@@ -513,6 +524,10 @@ export class MeteoraDammV2CopyBot {
   private readonly followerWalletSet!: Set<string>;
   private readonly knownWalletSet!: Set<string>;
   
+  // Dynamic wallet classification
+  private readonly walletProfiles = new Map<string, WalletProfile>(); // address -> profile
+  private readonly tokenAccountCache = new Map<string, string>(); // "mint:owner" -> tokenAccount
+  
   private started = false;
   private shouldStop = false;
   private reconnectAttempts = 0;
@@ -552,6 +567,8 @@ export class MeteoraDammV2CopyBot {
     this.leaderWalletSet = new Set(config.leaderWallets ?? []);
     this.followerWalletSet = new Set(config.followerWallets ?? []);
     this.knownWalletSet = new Set([...this.leaderWalletSet, ...this.followerWalletSet]);
+    
+    console.log(`[Bot] Loaded ${this.leaderWalletSet.size} LEADER wallets and ${this.followerWalletSet.size} FOLLOWER wallets`);
   }
 
   // ===== EARLY SCORE ENGINE HELPER FUNCTIONS =====
@@ -583,6 +600,153 @@ export class MeteoraDammV2CopyBot {
       consecutiveBuySamples: 0,
       walletAcceleration: 0,
     };
+  }
+
+  // ===== DYNAMIC WALLET CLASSIFICATION =====
+  
+  // Get token account address for a mint + owner
+  private async getTokenAccount(mint: string, owner: string): Promise<string | null> {
+    const cacheKey = `${mint}:${owner}`;
+    const cached = this.tokenAccountCache.get(cacheKey);
+    if (cached) return cached;
+    
+    try {
+      const url = `${HELIUS_BASE}/addresses/${owner}/balances?api-key=${this.heliusApiKey}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return null;
+      
+      const data = await resp.json() as any[];
+      const tokenAccount = data.find((b: any) => b.mint === mint);
+      
+      if (tokenAccount?.tokenAccount) {
+        this.tokenAccountCache.set(cacheKey, tokenAccount.tokenAccount);
+        return tokenAccount.tokenAccount;
+      }
+      return null;
+    } catch (err: any) {
+      console.error(`[Wallet] Error getting token account: ${err.message}`);
+      return null;
+    }
+  }
+
+  // Fetch wallets from token account transactions (amount = 2074080 = buy signal)
+  private async fetchWalletsFromTokenAccount(tokenAccount: string, mint: string): Promise<{ wallet: string; txIndex: number }[]> {
+    try {
+      const url = `${HELIUS_BASE}/addresses/${tokenAccount}/transactions?api-key=${this.heliusApiKey}&limit=100`;
+      const resp = await fetch(url);
+      if (!resp.ok) return [];
+      
+      const txs = await resp.json() as any[];
+      const wallets: { wallet: string; txIndex: number }[] = [];
+      
+      // Reverse to get chronological order (oldest first)
+      const reversedTxs = txs.reverse();
+      
+      for (let i = 0; i < reversedTxs.length; i++) {
+        const tx = reversedTxs[i];
+        
+        // Look for nativeTransfers with amount 2074080 (buy signal)
+        if (tx.nativeTransfers) {
+          for (const transfer of tx.nativeTransfers) {
+            if (transfer.amount === 2074080 && transfer.toUserAccount) {
+              wallets.push({
+                wallet: transfer.toUserAccount,
+                txIndex: i,
+              });
+            }
+          }
+        }
+      }
+      
+      return wallets;
+    } catch (err: any) {
+      console.error(`[Wallet] Error fetching wallets from token account: ${err.message}`);
+      return [];
+    }
+  }
+
+  // Update wallet profile based on tx position
+  private updateWalletProfile(wallet: string, txIndex: number, mint: string): void {
+    let profile = this.walletProfiles.get(wallet);
+    
+    if (!profile) {
+      profile = {
+        address: wallet,
+        leaderScore: 0,
+        followerScore: 0,
+        earlyAppearances: 0,
+        totalAppearances: 0,
+        tokensSeen: new Set(),
+        lastSeenAt: Date.now(),
+      };
+      this.walletProfiles.set(wallet, profile);
+    }
+    
+    // Only count if this wallet hasn't been seen in this token yet
+    if (!profile.tokensSeen.has(mint)) {
+      profile.tokensSeen.add(mint);
+      profile.totalAppearances++;
+      
+      // Leader: appears in first 15 txs
+      if (txIndex <= 15) {
+        profile.leaderScore += 2;
+        profile.earlyAppearances++;
+        console.log(`[Wallet] 🟨 LEADER score update: ${wallet.slice(0, 8)}... (tx #${txIndex}, leaderScore=${profile.leaderScore})`);
+      }
+      // Follower: appears in tx 15-100
+      else if (txIndex <= 100) {
+        profile.followerScore += 1;
+        console.log(`[Wallet] 🟦 FOLLOWER score update: ${wallet.slice(0, 8)}... (tx #${txIndex}, followerScore=${profile.followerScore})`);
+      }
+      
+      // Auto-classify based on scores
+      this.classifyWallet(wallet, profile);
+    }
+    
+    profile.lastSeenAt = Date.now();
+  }
+
+  // Classify wallet as leader/follower based on profile
+  private classifyWallet(wallet: string, profile: WalletProfile): void {
+    // Leader: score >= 6 AND appeared early in >= 3 tokens
+    if (profile.leaderScore >= 6 && profile.earlyAppearances >= 3) {
+      if (!this.leaderWalletSet.has(wallet)) {
+        this.leaderWalletSet.add(wallet);
+        this.knownWalletSet.add(wallet);
+        console.log(`[Wallet] 🟨 AUTO-CLASSIFIED AS LEADER: ${wallet} (leaderScore=${profile.leaderScore}, earlyAppearances=${profile.earlyAppearances}, tokensSeen=${profile.tokensSeen.size})`);
+      }
+    }
+    // Follower: score >= 5
+    else if (profile.followerScore >= 5) {
+      if (!this.followerWalletSet.has(wallet)) {
+        this.followerWalletSet.add(wallet);
+        this.knownWalletSet.add(wallet);
+        console.log(`[Wallet] 🟦 AUTO-CLASSIFIED AS FOLLOWER: ${wallet} (followerScore=${profile.followerScore}, tokensSeen=${profile.tokensSeen.size})`);
+      }
+    }
+  }
+
+  // Learn wallets from a successful token
+  private async learnWalletsFromToken(mint: string, tokenAccountLeader: string): Promise<void> {
+    const tokenAccount = await this.getTokenAccount(mint, tokenAccountLeader);
+    if (!tokenAccount) {
+      console.log(`[Wallet] No token account found for ${mint.slice(0, 8)}... owner=${tokenAccountLeader.slice(0, 8)}...`);
+      return;
+    }
+    
+    console.log(`[Wallet] 📚 Learning wallets from token ${mint.slice(0, 8)}... (tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
+    
+    const wallets = await this.fetchWalletsFromTokenAccount(tokenAccount, mint);
+    console.log(`[Wallet] Found ${wallets.length} wallets for ${mint.slice(0, 8)}...`);
+    
+    for (const { wallet, txIndex } of wallets) {
+      this.updateWalletProfile(wallet, txIndex, mint);
+    }
+    
+    // Log summary
+    const leaders = wallets.filter(w => w.txIndex <= 15).length;
+    const followers = wallets.filter(w => w.txIndex > 15 && w.txIndex <= 100).length;
+    console.log(`[Wallet] 📊 ${mint.slice(0, 8)}...: ${leaders} early (potential leaders), ${followers} mid (potential followers)`);
   }
 
   private updateEarlyMetrics(tracker: TokenEarlyMetrics, tx: EarlyTx): void {
@@ -671,9 +835,9 @@ export class MeteoraDammV2CopyBot {
     else score -= 15;
 
     // Known swarm presence (weighted)
-    // Leaders = +8 each, Followers = +3 each
-    const leaderBonus = tracker.leaderWalletHits * 8;
-    const followerBonus = tracker.followerWalletHits * 3;
+    // Leaders = +10 each (alpha signal), Followers = +4 each (swarm confirmation)
+    const leaderBonus = tracker.leaderWalletHits * 10;
+    const followerBonus = tracker.followerWalletHits * 4;
     
     if (knownWalletRatio >= 0.5) score += 20;
     else if (knownWalletRatio >= 0.25) score += 10;
@@ -1417,12 +1581,21 @@ export class MeteoraDammV2CopyBot {
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
+          
+          // Learn wallets from TOKEN_ACCOUNT_LEADER's token account for this mint
+          if (this.config.tokenAccountSlLeader) {
+            this.learnWalletsFromToken(mint, this.config.tokenAccountSlLeader).catch(err => {
+              console.error(`[Wallet] Error learning wallets: ${err.message}`);
+            });
+          }
         }
 
         // ===== FETCH REAL TRANSACTIONS FROM POOL =====
         // Get actual txs with wallet addresses, not just pool snapshots
         if (!tracker.evaluated && tracker.txs.length < 200) {
           const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, tracker.txs.length);
+          
+          console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs for ${mint.slice(0, 8)}... (total tracked: ${tracker.txs.length})`);
           
           for (const poolTx of poolTxs) {
             const earlyTx: EarlyTx = {
@@ -1434,13 +1607,23 @@ export class MeteoraDammV2CopyBot {
             };
             this.updateEarlyMetrics(tracker, earlyTx);
             
-            // Log known wallet hits
+            // Log ALL wallets found
             if (poolTx.wallet) {
-              if (this.leaderWalletSet.has(poolTx.wallet)) {
-                console.log(`[EarlyScore] 🟨 LEADER wallet found: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
-              } else if (this.followerWalletSet.has(poolTx.wallet)) {
-                console.log(`[EarlyScore] 🟦 FOLLOWER wallet found: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+              const isLeader = this.leaderWalletSet.has(poolTx.wallet);
+              const isFollower = this.followerWalletSet.has(poolTx.wallet);
+              
+              if (isLeader) {
+                console.log(`[EarlyScore] 🟨 LEADER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
+              } else if (isFollower) {
+                console.log(`[EarlyScore] 🟦 FOLLOWER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
+              } else {
+                // Log first 10 unknown wallets to see what we're getting
+                if (tracker.uniqueWallets.size <= 10) {
+                  console.log(`[EarlyScore] ⚪ UNKNOWN wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
+                }
               }
+            } else {
+              console.log(`[EarlyScore] ⚠️ NO WALLET for tx ${poolTx.signature.slice(0, 8)}... (side=${poolTx.side})`);
             }
           }
         }
