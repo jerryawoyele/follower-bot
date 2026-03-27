@@ -216,7 +216,7 @@ type FollowState = {
   highestProfit: number; // Highest profit % reached
   // Enhanced momentum tracking for exits
   momentumScore: number;
-  momentumHistory: number[];
+  momentumHistory: number[]; // Last N momentum values for slope detection
   momentumIncreasing: boolean;
   consecutiveBuys: number;
   consecutiveSells: number;
@@ -226,6 +226,11 @@ type FollowState = {
   // Breakout protection
   intervalsSinceEntry: number; // How many pool checks since entry
   peakMomentum: number; // Highest momentum seen since entry
+  // Post-entry validation (Stage 1 vs Stage 2)
+  entryStage: 1 | 2; // Which stage triggered the buy
+  entryTime: number; // Timestamp of entry (ms)
+  postEntryValidated: boolean; // Has post-entry structure been validated?
+  earlyKillTriggered: boolean; // Was early kill switch activated?
 };
 
 // Helius API types
@@ -1721,7 +1726,7 @@ export class MeteoraDammV2CopyBot {
               console.log(`[Bot] 🟢 STAGE 1 BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
               this.pendingPositions.delete(mint);
               this.attemptedBuys.add(mint);
-              await this.copyBuyFromPending(pending);
+              await this.copyBuyFromPending(pending, 1);
               continue;
             } else if (tracker.decision === "watchlist") {
               // WATCHLIST: Move to stage 2 for momentum confirmation
@@ -1753,7 +1758,7 @@ export class MeteoraDammV2CopyBot {
               tracker.decision = "good";
               this.pendingPositions.delete(mint);
               this.attemptedBuys.add(mint);
-              await this.copyBuyFromPending(pending);
+              await this.copyBuyFromPending(pending, 2);
               continue;
             }
             
@@ -1889,6 +1894,55 @@ export class MeteoraDammV2CopyBot {
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
         
+        // ===== POST-ENTRY VALIDATION (Stage 1 vs Stage 2) =====
+        // Stage 1 buys need validation, Stage 2 buys are pre-validated
+        const timeSinceEntry = Date.now() - position.entryTime;
+        const earlyWindow = timeSinceEntry < 10000; // First 10 seconds
+        
+        // EARLY KILL SWITCH: Exit immediately if bad structure within 10s of entry
+        // This catches fake pumps that collapse right after entry
+        if (earlyWindow && !position.earlyKillTriggered && position.entryStage === 1) {
+          if (position.consecutiveSells >= 2 && momentumScore <= -4) {
+            console.log(`[Bot] ⚡ EARLY KILL SWITCH: ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} time=${(timeSinceEntry/1000).toFixed(1)}s)`);
+            position.earlyKillTriggered = true;
+            await this.copySell(mint, "EARLY_KILL_SWITCH", 100);
+            continue;
+          }
+        }
+        
+        // POST-ENTRY VALIDATION: Check if momentum is expanding after entry
+        // Stage 1 buys need 5 intervals to prove themselves
+        if (!position.postEntryValidated && position.intervalsSinceEntry >= 5) {
+          if (position.entryStage === 1) {
+            // Check for momentum expansion (slope positive)
+            const momSlope = position.momentumHistory.length >= 3
+              ? position.momentumHistory[2] - position.momentumHistory[0]
+              : 0;
+            
+            const hasMomentumExpansion = momSlope > 0 || position.peakMomentum >= 4;
+            const hasConsecBuys = position.consecutiveBuys >= 3;
+            const noEarlySells = position.consecutiveSells < 2;
+            
+            if (hasMomentumExpansion && (hasConsecBuys || noEarlySells)) {
+              position.postEntryValidated = true;
+              console.log(`[Bot] ✅ POST-ENTRY VALIDATED: ${mint.slice(0, 8)}... (stage=1 slope=${momSlope.toFixed(1)} peakMom=${position.peakMomentum.toFixed(1)})`);
+            } else if (momentumScore <= -4 || position.consecutiveSells >= 2) {
+              // Failed validation - exit
+              console.log(`[Bot] ❌ POST-ENTRY FAILED: ${mint.slice(0, 8)}... (stage=1 no momentum expansion, slope=${momSlope.toFixed(1)})`);
+              await this.copySell(mint, "VALIDATION_FAILED", 100);
+              continue;
+            } else {
+              // Weak but not terrible - mark validated but with low confidence
+              position.postEntryValidated = true;
+              console.log(`[Bot] ⚠️ POST-ENTRY WEAK: ${mint.slice(0, 8)}... (stage=1 validated with low confidence)`);
+            }
+          } else {
+            // Stage 2 buys are pre-validated by momentum confirmation
+            position.postEntryValidated = true;
+            console.log(`[Bot] ✅ STAGE 2 PRE-VALIDATED: ${mint.slice(0, 8)}...`);
+          }
+        }
+
         // ===== BREAKOUT PROTECTION =====
         // First pullback after breakout is NOT an exit signal
         // Ignore single sells in first 5 intervals after entry
@@ -1927,10 +1981,18 @@ export class MeteoraDammV2CopyBot {
         } else if (strongTrendOverride) {
           // Skip exits if strong trend override (had momentum > 5)
           console.log(`[Bot] Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
-        } else if (extremeDump || possibleLiquidityPull || dangerExit || position.trendBroken) {
-          // HARD EXIT: Any exit condition triggers immediate sell
-          console.log(`[Bot] HARD EXIT: ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit})`);
+        } else if (extremeDump || possibleLiquidityPull) {
+          // HARD EXIT: Only for extreme events (rug already happened)
+          console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
           await this.copySell(mint, "HARD_EXIT", 100);
+        } else if (dangerExit) {
+          // STRUCTURE EXIT: Exit during warning phase (before collapse)
+          console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
+          await this.copySell(mint, "STRUCTURE_EXIT", 100);
+        } else if (position.trendBroken) {
+          // SOFT EXIT: Trend definitively broken (fallback)
+          console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)})`);
+          await this.copySell(mint, "SOFT_EXIT", 100);
         }
 
         position.prevPoolSnapshot = snapshot;
@@ -1941,8 +2003,8 @@ export class MeteoraDammV2CopyBot {
   }
 
   // Buy from pending position (triggered by state machine)
-  private async copyBuyFromPending(pending: PendingPosition): Promise<void> {
-    console.log(`[Bot] Executing buy for ${pending.mint.slice(0, 8)}... (verdict: ENTRY_READY)`);
+  private async copyBuyFromPending(pending: PendingPosition, entryStage: 1 | 2 = 1): Promise<void> {
+    console.log(`[Bot] Executing buy for ${pending.mint.slice(0, 8)}... (verdict: ENTRY_READY, stage=${entryStage})`);
 
     const connection = new Connection(this.config.rpcUrl, "confirmed");
     const owner = this.trader.ownerPubkey;
@@ -2047,6 +2109,11 @@ export class MeteoraDammV2CopyBot {
       // Breakout protection
       intervalsSinceEntry: 0,
       peakMomentum: 0,
+      // Post-entry validation
+      entryStage: entryStage,
+      entryTime: Date.now(),
+      postEntryValidated: false,
+      earlyKillTriggered: false,
     });
 
     console.log(
@@ -2358,6 +2425,11 @@ export class MeteoraDammV2CopyBot {
       // Breakout protection
       intervalsSinceEntry: 0,
       peakMomentum: 0,
+      // Post-entry validation
+      entryStage: 1, // Direct copy uses Stage 1
+      entryTime: Date.now(),
+      postEntryValidated: false,
+      earlyKillTriggered: false,
     });
 
     console.log(
