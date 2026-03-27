@@ -118,6 +118,10 @@ type TokenEarlyMetrics = {
   knownWalletHits: number;
   leaderWalletHits: number;
   followerWalletHits: number;
+  
+  // Leader detection - track early appearances
+  leaderEarlyHits: number; // Leaders seen in first 20 txs
+  first20LeaderWallets: Set<string>; // Unique leaders in first 20 txs
 
   buyCount: number;
   sellCount: number;
@@ -544,6 +548,8 @@ export class MeteoraDammV2CopyBot {
       knownWalletHits: 0,
       leaderWalletHits: 0,
       followerWalletHits: 0,
+      leaderEarlyHits: 0,
+      first20LeaderWallets: new Set(),
       buyCount: 0,
       sellCount: 0,
       unknownCount: 0,
@@ -557,6 +563,7 @@ export class MeteoraDammV2CopyBot {
   }
 
   private updateEarlyMetrics(tracker: TokenEarlyMetrics, tx: EarlyTx): void {
+    const txIndex = tracker.txs.length; // Get index before push
     tracker.txs.push(tx);
 
     // Track wallet
@@ -574,6 +581,12 @@ export class MeteoraDammV2CopyBot {
       if (this.leaderWalletSet.has(tx.from)) {
         tracker.leaderWalletHits += 1;
         tracker.knownWalletHits += 1;
+        
+        // Track early leader appearances (first 20 txs)
+        if (txIndex < 20 && !tracker.first20LeaderWallets.has(tx.from)) {
+          tracker.first20LeaderWallets.add(tx.from);
+          tracker.leaderEarlyHits += 1;
+        }
       } else if (this.followerWalletSet.has(tx.from)) {
         tracker.followerWalletHits += 1;
         tracker.knownWalletHits += 1;
@@ -612,6 +625,14 @@ export class MeteoraDammV2CopyBot {
 
     let score = 0;
 
+    // 🚨 EARLY LEADER DETECTION - STRONGEST SIGNAL
+    // 2+ unique leaders in first 20 txs = huge confidence boost
+    if (tracker.leaderEarlyHits >= 2 && txCount <= 30) {
+      score += 30; // Huge boost - this is the alpha signal
+    } else if (tracker.leaderEarlyHits >= 1 && txCount <= 30) {
+      score += 15; // Still strong
+    }
+
     // Speed (tx compression)
     if (txPerSecond >= 3) score += 20;
     else if (txPerSecond >= 1.5) score += 10;
@@ -625,6 +646,7 @@ export class MeteoraDammV2CopyBot {
     else if (buyRatio >= 0.85) score += 10;
 
     // Known swarm presence (weighted)
+    // Leaders = +8 each, Followers = +3 each
     const leaderBonus = tracker.leaderWalletHits * 8;
     const followerBonus = tracker.followerWalletHits * 3;
     if (knownWalletRatio >= 0.5) score += 25;
