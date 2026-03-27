@@ -148,6 +148,15 @@ type PoolSnapshot = {
   ts: number;
 };
 
+// Pool transaction for early score engine
+type PoolTx = {
+  signature: string;
+  timestamp: number;
+  wallet?: string;
+  side: "buy" | "sell" | "unknown";
+  amount: number;
+};
+
 // Pending position - migration detected but not yet bought
 type PendingPosition = {
   mint: string;
@@ -637,36 +646,44 @@ export class MeteoraDammV2CopyBot {
     if (txPerSecond >= 3) score += 20;
     else if (txPerSecond >= 1.5) score += 10;
 
-    // Diversity (unique wallets)
-    if (uniqueWalletRatio >= 0.8) score += 20;
-    else if (uniqueWalletRatio >= 0.65) score += 10;
+    // Diversity (unique wallets) - CRITICAL METRIC
+    if (uniqueWalletRatio >= 0.75) score += 20;
+    else if (uniqueWalletRatio >= 0.60) score += 10;
+    else score -= 15; // Low diversity = suspicious
 
-    // Buy pressure
-    if (buyRatio >= 0.95) score += 25;
-    else if (buyRatio >= 0.85) score += 10;
+    // Buy pressure - handle mixed flow better
+    if (buyRatio >= 0.80) score += 20;
+    else if (buyRatio >= 0.55) score += 5; // Mixed but still tradable
+    else score -= 15;
 
     // Known swarm presence (weighted)
     // Leaders = +8 each, Followers = +3 each
     const leaderBonus = tracker.leaderWalletHits * 8;
     const followerBonus = tracker.followerWalletHits * 3;
-    if (knownWalletRatio >= 0.5) score += 25;
+    
+    if (knownWalletRatio >= 0.5) score += 20;
     else if (knownWalletRatio >= 0.25) score += 10;
+    else if (knownWalletRatio >= 0.10) score += 5;
+    else score -= 10; // No known wallets = less confidence
+    
     score += leaderBonus + followerBonus;
 
     // Repetition penalty
     if (repeatedWalletRatio > 0.3) score -= 10;
 
-    // Early sell penalty
-    if (tracker.firstSellAtTx !== undefined && tracker.firstSellAtTx <= 50) {
-      score -= 25;
+    // Early sell penalty - only heavy penalty for VERY early sells
+    if (tracker.firstSellAtTx !== undefined && tracker.firstSellAtTx <= 20) {
+      score -= 25; // Very early sell = bad
+    } else if (tracker.firstSellAtTx !== undefined && tracker.firstSellAtTx <= 50) {
+      score -= 10; // Early sell but not terrible
     }
 
     return score;
   }
 
   private classifyEarlyToken(score: number): "good" | "bad" | "pending" {
-    if (score >= 65) return "good";
-    if (score <= 25) return "bad";
+    if (score >= 60) return "good";
+    if (score < 30) return "bad";
     return "pending";
   }
 
@@ -674,9 +691,11 @@ export class MeteoraDammV2CopyBot {
     const txCount = tracker.txs.length;
     const elapsedMs = now - tracker.startedAt;
 
+    // Soft classification at 30, real decision at 50, hard reject allowed at 80+
     return (
       txCount === 30 ||
       txCount === 50 ||
+      txCount === 80 ||
       txCount === 100 ||
       txCount >= 200 ||
       elapsedMs >= 60_000
@@ -1226,6 +1245,69 @@ export class MeteoraDammV2CopyBot {
     }
   }
 
+  // Fetch transactions for a pool with wallet addresses
+  private async fetchPoolTransactions(poolAddress: string, skipCount: number): Promise<PoolTx[]> {
+    try {
+      const url = new URL(`${HELIUS_BASE}/addresses/${poolAddress}/transactions`);
+      url.searchParams.set("api-key", this.heliusApiKey);
+      url.searchParams.set("limit", "50");
+      
+      const resp = await fetch(url.toString());
+      if (!resp.ok) return [];
+      
+      const txs = await resp.json() as any[];
+      const result: PoolTx[] = [];
+      
+      for (const tx of txs) {
+        // Skip already processed
+        if (skipCount > 0) {
+          skipCount--;
+          continue;
+        }
+        
+        // Determine side from tokenTransfers
+        let side: "buy" | "sell" | "unknown" = "unknown";
+        let amount = 0;
+        let wallet: string | undefined;
+        
+        if (tx.tokenTransfers && tx.tokenTransfers.length >= 2) {
+          const first = tx.tokenTransfers[0];
+          const second = tx.tokenTransfers[1];
+          
+          if (first.mint === SOL_MINT) {
+            // SOL out = BUY
+            side = "buy";
+            amount = first.tokenAmount || 0;
+            wallet = first.fromUserAccount;
+          } else if (second.mint === SOL_MINT) {
+            // SOL in = SELL
+            side = "sell";
+            amount = second.tokenAmount || 0;
+            wallet = first.fromUserAccount;
+          }
+        }
+        
+        // Also check nativeTransfers for wallet
+        if (!wallet && tx.nativeTransfers && tx.nativeTransfers.length > 0) {
+          wallet = tx.nativeTransfers[0].fromUserAccount;
+        }
+        
+        result.push({
+          signature: tx.signature,
+          timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+          wallet,
+          side,
+          amount,
+        });
+      }
+      
+      return result;
+    } catch (err: any) {
+      console.error(`[Pool] Error fetching txs for ${poolAddress.slice(0, 8)}...: ${err.message}`);
+      return [];
+    }
+  }
+
   private async checkPool(): Promise<void> {
     const profitExitPercent = this.config.profitExitPercent ?? 1;
     const poolRpcUrl = this.config.poolRpcUrl ?? this.config.rpcUrl;
@@ -1265,16 +1347,31 @@ export class MeteoraDammV2CopyBot {
           this.earlyMetricsMap.set(mint, tracker);
         }
 
-        // ===== EARLY SCORE ENGINE: Update with each pool check as a "tx" =====
-        // Each pool check interval = one tx event
-        const earlyTx: EarlyTx = {
-          signature: `${mint}-${tracker.txs.length}`,
-          ts: now,
-          from: undefined, // We don't have wallet info from pool checks
-          side: buyPressure ? "buy" : sellPressure ? "sell" : "unknown",
-          amount: Math.abs(dQuote), // Use quote change as amount proxy
-        };
-        this.updateEarlyMetrics(tracker, earlyTx);
+        // ===== FETCH REAL TRANSACTIONS FROM POOL =====
+        // Get actual txs with wallet addresses, not just pool snapshots
+        if (!tracker.evaluated && tracker.txs.length < 200) {
+          const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, tracker.txs.length);
+          
+          for (const poolTx of poolTxs) {
+            const earlyTx: EarlyTx = {
+              signature: poolTx.signature,
+              ts: poolTx.timestamp * 1000,
+              from: poolTx.wallet, // Real wallet address
+              side: poolTx.side,
+              amount: poolTx.amount,
+            };
+            this.updateEarlyMetrics(tracker, earlyTx);
+            
+            // Log known wallet hits
+            if (poolTx.wallet) {
+              if (this.leaderWalletSet.has(poolTx.wallet)) {
+                console.log(`[EarlyScore] 🟨 LEADER wallet found: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+              } else if (this.followerWalletSet.has(poolTx.wallet)) {
+                console.log(`[EarlyScore] 🟦 FOLLOWER wallet found: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+              }
+            }
+          }
+        }
 
         // ===== EARLY SCORE ENGINE: Evaluate at staged points =====
         if (this.shouldEvaluateEarly(tracker, now) && !tracker.evaluated) {
@@ -1289,7 +1386,7 @@ export class MeteoraDammV2CopyBot {
             ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
             : "0.00";
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision}`);
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision}`);
 
           // ===== DECISION FLOW =====
           if (tracker.decision === "good" && tracker.txs.length >= 30) {
