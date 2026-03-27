@@ -1927,18 +1927,10 @@ export class MeteoraDammV2CopyBot {
         } else if (strongTrendOverride) {
           // Skip exits if strong trend override (had momentum > 5)
           console.log(`[Bot] Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
-        } else if (extremeDump || possibleLiquidityPull) {
-          // HARD EXIT: Only for extreme events (rug already happened)
-          console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
+        } else if (extremeDump || possibleLiquidityPull || dangerExit || position.trendBroken) {
+          // HARD EXIT: Any exit condition triggers immediate sell
+          console.log(`[Bot] HARD EXIT: ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit})`);
           await this.copySell(mint, "HARD_EXIT", 100);
-        } else if (dangerExit) {
-          // STRUCTURE EXIT: Exit during warning phase (before collapse)
-          console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
-          await this.copySell(mint, "STRUCTURE_EXIT", 100);
-        } else if (position.trendBroken) {
-          // SOFT EXIT: Trend definitively broken (fallback)
-          console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)})`);
-          await this.copySell(mint, "SOFT_EXIT", 100);
         }
 
         position.prevPoolSnapshot = snapshot;
