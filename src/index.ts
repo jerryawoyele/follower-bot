@@ -1378,23 +1378,34 @@ export class MeteoraDammV2CopyBot {
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
         
-        // ===== TREND BREAK DETECTION =====
-        // Trend is broken when:
-        // 1. consecBuys reset to 0 AND
-        // 2. momentum dropping AND  
-        // 3. no recovery after 3+ intervals
+        // ===== AGGRESSIVE TREND BREAK DETECTION =====
+        // Exit early on persistent weakness, don't wait for collapse
+        // Trend is broken when ANY of these are true:
+        // 1. 2+ consecutive sells (selling pressure building)
+        // 2. Momentum deeply negative (<= -6)
+        // 3. No buys and negative momentum and price dropping
         position.trendBroken = 
-          position.consecutiveBuys === 0 &&
-          !position.momentumIncreasing &&
-          position.recoveryFails > 3 &&
-          position.dipsAbsorbed === 0; // No dips absorbed = no buyers
+          position.consecutiveSells >= 2 ||
+          position.momentumScore <= -6 ||
+          (position.consecutiveBuys === 0 && position.momentumScore < -4 && priceMovePct < 0);
+
+        // ===== DANGER EXIT CONDITIONS =====
+        // Exit during warning phase, before the actual collapse
+        // These catch rugs patterns early
+        const dangerExit =
+          position.consecutiveSells >= 2 ||
+          position.momentumScore <= -6 ||
+          (position.momentumScore < 0 && !position.momentumIncreasing && sellPressure);
+
+        // Check if last bounce was weak (buy followed by immediate sell)
+        const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && position.momentumScore < 0;
 
         const isUnstable = position.flipCount > 5 && !position.momentumIncreasing;
         const weakTrend = position.weakTrendCounter > 2 && !position.momentumIncreasing;
         const noRecovery = position.recoveryFails > 3;
 
         // ===== STATE MACHINE LOGIC (POST-BUY) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... state=${position.poolState} profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} trendBroken=${position.trendBroken}`);
+        console.log(`[Pool] ${mint.slice(0, 8)}... state=${position.poolState} profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit}`);
         
         switch (position.poolState) {
           case PoolState.WATCH:
@@ -1410,19 +1421,24 @@ export class MeteoraDammV2CopyBot {
             break;
 
           case PoolState.HOLD:
-            // HARD EXIT: Only for extreme events
+            // HARD EXIT: Only for extreme events (rug already happened)
             if (extremeDump || possibleLiquidityPull) {
               console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
               await this.copySell(mint, "HARD_EXIT", 100);
               position.poolState = PoolState.EXIT;
             } 
-            // SOFT EXIT: Only when trend is definitively broken
+            // STRUCTURE EXIT: Exit during warning phase (before collapse)
+            else if (dangerExit && position.highestProfit >= 0) {
+              console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
+              await this.copySell(mint, "STRUCTURE_EXIT", 100);
+              position.poolState = PoolState.EXIT;
+            }
+            // SOFT EXIT: Trend definitively broken (fallback)
             else if (position.trendBroken) {
               console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)})`);
               await this.copySell(mint, "SOFT_EXIT", 100);
               position.poolState = PoolState.EXIT;
             }
-            // Allow dips to recover - don't exit on single sell
             break;
 
           case PoolState.EXIT:
