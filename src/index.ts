@@ -101,6 +101,15 @@ type JupiterExecuteResponse = {
 // Early score engine types
 type TxSide = "buy" | "sell" | "unknown";
 
+// Token state machine for sophisticated classification
+type TokenState = 
+  | "DORMANT"           // Too little evidence yet, watching
+  | "STAGE1_STRONG"     // Early score strong, good wallet quality, buys chaining
+  | "STAGE1_STALLED"    // Activity present but conviction weak, no buy compression
+  | "LATE_IGNITION"     // Dormant token suddenly woke up with fresh buys
+  | "STAGE2_CONFIRMED"  // Post-Stage-1 continuation proven with momentum
+  | "REJECTED";         // Clear weakness, exit tracking
+
 type EarlyTx = {
   signature: string;
   ts: number;              // ms timestamp
@@ -141,6 +150,14 @@ type TokenEarlyMetrics = {
   score: number;
   decision: "good" | "bad" | "pending" | "watchlist" | "none";
   evaluated: boolean;
+  
+  // State machine for sophisticated classification
+  state: TokenState;
+  prevKnownHits: number; // Known hits from previous check (for delta)
+  knownHitsDelta: number; // Change in known hits recently
+  newTxsLastBatch: number; // New txs in most recent fetch
+  buyCompression: boolean; // Are buys compressing (consecutive buys >= 2)
+  ignitionDetectedAt?: number; // Timestamp when LATE_IGNITION was detected
   
   // Two-stage entry system
   stage: 1 | 2; // Stage 1 = early structure, Stage 2 = momentum confirmation
@@ -608,6 +625,13 @@ export class MeteoraDammV2CopyBot {
       score: 0,
       decision: "none",
       evaluated: false,
+      // State machine
+      state: "DORMANT",
+      prevKnownHits: 0,
+      knownHitsDelta: 0,
+      newTxsLastBatch: 0,
+      buyCompression: false,
+      ignitionDetectedAt: undefined,
       // Two-stage entry
       stage: 1,
       stage2Confirmations: 0,
@@ -1702,6 +1726,58 @@ export class MeteoraDammV2CopyBot {
           } else {
             console.log(`[EarlyScore] 📋 Fetched 0 txs for ${mint.slice(0, 8)}... (total tracked: ${tracker.txs.length})`);
           }
+          
+          // ===== STATE MACHINE TRANSITIONS =====
+          // Track known hits delta for ignition detection
+          tracker.knownHitsDelta = tracker.knownWalletHits - tracker.prevKnownHits;
+          tracker.newTxsLastBatch = newTxs;
+          tracker.prevKnownHits = tracker.knownWalletHits;
+          
+          // Detect buy compression (consecutive buys in recent txs)
+          const recentTxs = tracker.txs.slice(-10);
+          const recentBuys = recentTxs.filter(tx => tx.side === "buy").length;
+          tracker.buyCompression = recentBuys >= 6; // 60%+ buys in last 10 txs
+          
+          // State transitions
+          const prevState = tracker.state;
+          
+          // DORMANT → LATE_IGNITION: Dormant token suddenly woke up
+          if (tracker.state === "DORMANT") {
+            const insiderAppeared = tracker.knownHitsDelta > 0;
+            const txBurst = tracker.newTxsLastBatch >= 3;
+            const highBuyRatio = tracker.buyCount + tracker.sellCount > 0 
+              && tracker.buyCount / (tracker.buyCount + tracker.sellCount) >= 0.9;
+            
+            if (insiderAppeared && txBurst && highBuyRatio) {
+              tracker.state = "LATE_IGNITION";
+              tracker.ignitionDetectedAt = Date.now();
+              console.log(`[EarlyScore] 🔥 LATE IGNITION: ${mint.slice(0, 8)}... (knownHits +${tracker.knownHitsDelta}, newTxs=${tracker.newTxsLastBatch})`);
+            }
+          }
+          
+          // STAGE1_STRONG → STAGE2_CONFIRMED: Strong token confirmed momentum
+          if (tracker.state === "STAGE1_STRONG" || tracker.state === "LATE_IGNITION") {
+            const hasBuys = tracker.buyCompression;
+            const noEarlySells = tracker.sellCount < 3; // Few sells overall
+            const goodScore = tracker.score >= 60;
+            
+            if (hasBuys && noEarlySells && goodScore) {
+              tracker.state = "STAGE2_CONFIRMED";
+              console.log(`[EarlyScore] ✅ STAGE2_CONFIRMED: ${mint.slice(0, 8)}... (from ${prevState})`);
+            }
+          }
+          
+          // STAGE1_STALLED → REJECTED: Stalled token with early sell pressure
+          if (tracker.state === "STAGE1_STALLED") {
+            const hasSellPressure = tracker.sellCount >= 3;
+            const lowMomentum = tracker.score < 30;
+            
+            if (hasSellPressure && lowMomentum) {
+              tracker.state = "REJECTED";
+              console.log(`[EarlyScore] ❌ REJECTED: ${mint.slice(0, 8)}... (stalled + sell pressure)`);
+              tracker.evaluated = true;
+            }
+          }
         }
 
         // ===== EARLY SCORE ENGINE: Evaluate at staged points =====
@@ -1717,12 +1793,73 @@ export class MeteoraDammV2CopyBot {
             ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
             : "0.00";
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} (raw=${tracker.rawFetchedCount}, dups=${tracker.duplicateCount}) tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision} stage=${tracker.stage}`);
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} (raw=${tracker.rawFetchedCount}, dups=${tracker.duplicateCount}) tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} state=${tracker.state} decision=${tracker.decision}`);
 
+          // ===== INITIAL STATE CLASSIFICATION =====
+          // Classify state based on early score (only if still DORMANT)
+          if (tracker.state === "DORMANT" && tracker.txs.length >= 20) {
+            const strongThreshold = 60;
+            const hasBuyCompression = tracker.buyCompression;
+            const hasActivity = tracker.txs.length >= 30;
+            
+            if (score >= strongThreshold && hasBuyCompression) {
+              tracker.state = "STAGE1_STRONG";
+              console.log(`[EarlyScore] 💪 STAGE1_STRONG: ${mint.slice(0, 8)}... (score=${score}, buyCompression=${hasBuyCompression})`);
+            } else if (hasActivity && !hasBuyCompression && score < 50) {
+              tracker.state = "STAGE1_STALLED";
+              console.log(`[EarlyScore] 🐌 STAGE1_STALLED: ${mint.slice(0, 8)}... (activity but no conviction, score=${score})`);
+            }
+            // Otherwise stays DORMANT - waiting for ignition
+          }
+
+          // ===== BUY TRIGGERS (State Machine Based) =====
+          // Only buy from STAGE1_STRONG, LATE_IGNITION, or STAGE2_CONFIRMED
+          
+          if (tracker.state === "STAGE1_STRONG" && tracker.txs.length >= 30) {
+            // STRONG: Trigger buy immediately
+            console.log(`[Bot] 🟢 STAGE1_STRONG BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
+            this.pendingPositions.delete(mint);
+            this.attemptedBuys.add(mint);
+            await this.copyBuyFromPending(pending, 1);
+            continue;
+          }
+          
+          if (tracker.state === "LATE_IGNITION" && tracker.txs.length >= 20) {
+            // LATE IGNITION: Buy after ignition confirmed
+            // But reject if no known wallet support
+            const hasKnownSupport = tracker.knownWalletHits > 0 || tracker.leaderWalletHits > 0 || tracker.followerWalletHits > 0;
+            
+            if (!hasKnownSupport) {
+              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (LATE_IGNITION but no known wallet support)`);
+              tracker.state = "REJECTED";
+              tracker.evaluated = true;
+              continue;
+            }
+            
+            const ignitionAge = Date.now() - (tracker.ignitionDetectedAt ?? Date.now());
+            if (ignitionAge < 30000) { // Within 30s of ignition
+              console.log(`[Bot] 🔥 LATE_IGNITION BUY: ${mint.slice(0, 8)}... (score=${score}, knownHits=${tracker.knownWalletHits})`);
+              this.pendingPositions.delete(mint);
+              this.attemptedBuys.add(mint);
+              await this.copyBuyFromPending(pending, 1);
+              continue;
+            }
+          }
+          
+          if (tracker.state === "STAGE2_CONFIRMED") {
+            // STAGE2 CONFIRMED: Buy with higher confidence
+            console.log(`[Bot] ✅ STAGE2_CONFIRMED BUY: ${mint.slice(0, 8)}... (score=${score})`);
+            this.pendingPositions.delete(mint);
+            this.attemptedBuys.add(mint);
+            await this.copyBuyFromPending(pending, 2);
+            continue;
+          }
+
+          // ===== LEGACY STAGE SYSTEM (Fallback) =====
           // ===== STAGE 1: Early Structure Decision =====
           if (tracker.stage === 1) {
             if (tracker.decision === "good" && tracker.txs.length >= 30) {
-              // GOOD: Trigger buy immediately
+              // GOOD: Trigger buy immediately (legacy path)
               console.log(`[Bot] 🟢 STAGE 1 BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
               this.pendingPositions.delete(mint);
               this.attemptedBuys.add(mint);
