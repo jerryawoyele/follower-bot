@@ -179,6 +179,9 @@ type FollowState = {
   dipsAbsorbed: number;
   lastDipRecovery: number;
   trendBroken: boolean; // Has the trend definitively broken?
+  // Breakout protection
+  intervalsSinceEntry: number; // How many pool checks since entry
+  peakMomentum: number; // Highest momentum seen since entry
 };
 
 // Helius API types
@@ -1308,6 +1311,14 @@ export class MeteoraDammV2CopyBot {
         // Calculate momentum score
         const momentumScore = position.consecutiveBuys * 2 - position.consecutiveSells * 1.5 - position.flipCount * 0.3;
         
+        // Track intervals since entry for breakout protection
+        position.intervalsSinceEntry++;
+        
+        // Track peak momentum for strong trend override
+        if (momentumScore > position.peakMomentum) {
+          position.peakMomentum = momentumScore;
+        }
+        
         // Track momentum history
         position.momentumHistory.push(momentumScore);
         if (position.momentumHistory.length > 5) position.momentumHistory.shift();
@@ -1378,24 +1389,32 @@ export class MeteoraDammV2CopyBot {
           (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
           (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
         
-        // ===== AGGRESSIVE TREND BREAK DETECTION =====
-        // Exit early on persistent weakness, don't wait for collapse
-        // Trend is broken when ANY of these are true:
-        // 1. 2+ consecutive sells (selling pressure building)
-        // 2. Momentum deeply negative (<= -6)
-        // 3. No buys and negative momentum and price dropping
-        position.trendBroken = 
-          position.consecutiveSells >= 2 ||
-          position.momentumScore <= -6 ||
-          (position.consecutiveBuys === 0 && position.momentumScore < -4 && priceMovePct < 0);
+        // ===== BREAKOUT PROTECTION =====
+        // First pullback after breakout is NOT an exit signal
+        // Ignore single sells in first 5 intervals after entry
+        const earlyPullback = 
+          position.intervalsSinceEntry < 5 &&
+          position.consecutiveSells === 1 &&
+          position.momentumScore > -4;
 
-        // ===== DANGER EXIT CONDITIONS =====
-        // Exit during warning phase, before the actual collapse
-        // These catch rugs patterns early
+        // Strong trend override: if we had strong momentum (>5), ignore first sell
+        const strongTrendOverride = 
+          position.peakMomentum > 5 &&
+          position.consecutiveSells === 1 &&
+          position.momentumScore > -4;
+
+        // ===== FIXED TREND BREAK DETECTION =====
+        // Only trend broken when confirmed weakness (not just single sell)
+        position.trendBroken = 
+          (position.consecutiveSells >= 2 && position.momentumScore <= -4) ||
+          position.momentumScore <= -6;
+
+        // ===== FIXED DANGER EXIT CONDITIONS =====
+        // Require BOTH consecutive sells AND negative momentum
+        // NOT just sellPressure alone
         const dangerExit =
-          position.consecutiveSells >= 2 ||
-          position.momentumScore <= -6 ||
-          (position.momentumScore < 0 && !position.momentumIncreasing && sellPressure);
+          (position.consecutiveSells >= 2 && position.momentumScore <= -4) ||
+          position.momentumScore <= -6;
 
         // Check if last bounce was weak (buy followed by immediate sell)
         const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && position.momentumScore < 0;
@@ -1421,6 +1440,18 @@ export class MeteoraDammV2CopyBot {
             break;
 
           case PoolState.HOLD:
+            // Skip exits during early pullback (first 5 intervals)
+            if (earlyPullback) {
+              console.log(`[Bot] HOLD: Early pullback for ${mint.slice(0, 8)}... ignoring (interval=${position.intervalsSinceEntry})`);
+              break;
+            }
+            
+            // Skip exits if strong trend override (had momentum > 5)
+            if (strongTrendOverride) {
+              console.log(`[Bot] HOLD: Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
+              break;
+            }
+            
             // HARD EXIT: Only for extreme events (rug already happened)
             if (extremeDump || possibleLiquidityPull) {
               console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
@@ -1428,7 +1459,7 @@ export class MeteoraDammV2CopyBot {
               position.poolState = PoolState.EXIT;
             } 
             // STRUCTURE EXIT: Exit during warning phase (before collapse)
-            else if (dangerExit && position.highestProfit >= 0) {
+            else if (dangerExit) {
               console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${position.momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
               await this.copySell(mint, "STRUCTURE_EXIT", 100);
               position.poolState = PoolState.EXIT;
@@ -1575,6 +1606,9 @@ export class MeteoraDammV2CopyBot {
       dipsAbsorbed: pending.dipsAbsorbed,
       lastDipRecovery: pending.lastDipRecovery,
       trendBroken: false,
+      // Breakout protection
+      intervalsSinceEntry: 0,
+      peakMomentum: pending.momentumScore,
     });
 
     console.log(
@@ -1908,6 +1942,9 @@ export class MeteoraDammV2CopyBot {
       dipsAbsorbed: 0,
       lastDipRecovery: 0,
       trendBroken: false,
+      // Breakout protection
+      intervalsSinceEntry: 0,
+      peakMomentum: 0,
     });
 
     console.log(
