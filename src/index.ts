@@ -604,76 +604,61 @@ export class MeteoraDammV2CopyBot {
 
   // ===== DYNAMIC WALLET CLASSIFICATION =====
   
-  // Get token account address for a mint + owner using RPC method
-  private async getTokenAccount(mint: string, owner: string): Promise<string | null> {
-    const cacheKey = `${mint}:${owner}`;
-    const cached = this.tokenAccountCache.get(cacheKey);
-    if (cached) return cached;
+  // Learn wallets from token mint by querying first 10 txs
+  // Look for nativeTransfers with amount=2074080, extract token account from accountData[2]
+  private async learnWalletsFromMint(mint: string, tokenAccountLeader: string): Promise<string | null> {
+    // Check if we already learned from this mint
+    const learnedKey = `learned:${mint}`;
+    if (this.tokenAccountCache.has(learnedKey)) {
+      return this.tokenAccountCache.get(learnedKey) ?? null;
+    }
     
     try {
-      // Use RPC method getTokenAccountsByOwner
-      const resp = await fetch(this.config.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "1",
-          method: "getTokenAccountsByOwner",
-          params: [
-            owner,
-            { mint },
-            { encoding: "jsonParsed", commitment: "confirmed" }
-          ]
-        })
-      });
-      
-      const data = await resp.json() as any;
-      
-      if (data.result?.value?.length > 0) {
-        const tokenAccount = data.result.value[0].pubkey;
-        this.tokenAccountCache.set(cacheKey, tokenAccount);
-        return tokenAccount;
-      }
-      return null;
-    } catch (err: any) {
-      console.error(`[Wallet] Error getting token account: ${err.message}`);
-      return null;
-    }
-  }
-
-  // Fetch wallets from token account transactions (amount = 2074080 = buy signal)
-  private async fetchWalletsFromTokenAccount(tokenAccount: string, mint: string): Promise<{ wallet: string; txIndex: number }[]> {
-    try {
-      const url = `${HELIUS_BASE}/addresses/${tokenAccount}/transactions?api-key=${this.heliusApiKey}&limit=100`;
+      // Query token mint directly for first 10 txs (ascending order = oldest first)
+      const url = `${HELIUS_BASE}/addresses/${mint}/transactions?api-key=${this.heliusApiKey}&limit=10&sort-order=asc`;
       const resp = await fetch(url);
-      if (!resp.ok) return [];
+      if (!resp.ok) return null;
       
       const txs = await resp.json() as any[];
-      const wallets: { wallet: string; txIndex: number }[] = [];
+      let tokenAccount: string | null = null;
       
-      // Reverse to get chronological order (oldest first)
-      const reversedTxs = txs.reverse();
-      
-      for (let i = 0; i < reversedTxs.length; i++) {
-        const tx = reversedTxs[i];
+      for (let txIndex = 0; txIndex < txs.length; txIndex++) {
+        const tx = txs[txIndex];
         
         // Look for nativeTransfers with amount 2074080 (buy signal)
-        if (tx.nativeTransfers) {
-          for (const transfer of tx.nativeTransfers) {
-            if (transfer.amount === 2074080 && transfer.toUserAccount) {
-              wallets.push({
-                wallet: transfer.toUserAccount,
-                txIndex: i,
-              });
+        if (tx.nativeTransfers && tx.nativeTransfers.length > 0) {
+          const transfer = tx.nativeTransfers[0];
+          
+          if (transfer.amount === 2074080) {
+            // Get token account from accountData[2].account
+            if (tx.accountData && tx.accountData.length >= 3) {
+              tokenAccount = tx.accountData[2].account;
+              
+              // Get the wallet that received SOL (toUserAccount) - this is the buyer
+              const buyerWallet = transfer.toUserAccount;
+              
+              if (buyerWallet) {
+                // Update wallet profile based on tx position
+                this.updateWalletProfile(buyerWallet, txIndex, mint);
+                
+                console.log(`[Wallet] 🟨 Found buyer: ${buyerWallet.slice(0, 8)}... (tx #${txIndex}, tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
+              }
+              
+              // Cache the token account for this mint
+              if (tokenAccount) {
+                const cacheKey = `${mint}:${tokenAccountLeader}`;
+                this.tokenAccountCache.set(cacheKey, tokenAccount);
+                this.tokenAccountCache.set(learnedKey, tokenAccount);
+              }
             }
           }
         }
       }
       
-      return wallets;
+      return tokenAccount;
     } catch (err: any) {
-      console.error(`[Wallet] Error fetching wallets from token account: ${err.message}`);
-      return [];
+      console.error(`[Wallet] Error learning wallets from mint: ${err.message}`);
+      return null;
     }
   }
 
@@ -736,38 +721,6 @@ export class MeteoraDammV2CopyBot {
         console.log(`[Wallet] 🟦 AUTO-CLASSIFIED AS FOLLOWER: ${wallet} (followerScore=${profile.followerScore}, tokensSeen=${profile.tokensSeen.size})`);
       }
     }
-  }
-
-  // Learn wallets from a successful token
-  private async learnWalletsFromToken(mint: string, tokenAccountLeader: string): Promise<void> {
-    // Check if we already learned from this mint
-    const learnedKey = `learned:${mint}`;
-    if (this.tokenAccountCache.has(learnedKey)) {
-      return; // Already processed
-    }
-    
-    const tokenAccount = await this.getTokenAccount(mint, tokenAccountLeader);
-    if (!tokenAccount) {
-      console.log(`[Wallet] No token account found for ${mint.slice(0, 8)}... owner=${tokenAccountLeader.slice(0, 8)}...`);
-      return;
-    }
-    
-    // Mark as learned
-    this.tokenAccountCache.set(learnedKey, tokenAccount);
-    
-    console.log(`[Wallet] 📚 Learning wallets from token ${mint.slice(0, 8)}... (tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
-    
-    const wallets = await this.fetchWalletsFromTokenAccount(tokenAccount, mint);
-    console.log(`[Wallet] Found ${wallets.length} wallets for ${mint.slice(0, 8)}...`);
-    
-    for (const { wallet, txIndex } of wallets) {
-      this.updateWalletProfile(wallet, txIndex, mint);
-    }
-    
-    // Log summary
-    const leaders = wallets.filter(w => w.txIndex <= 15).length;
-    const followers = wallets.filter(w => w.txIndex > 15 && w.txIndex <= 100).length;
-    console.log(`[Wallet] 📊 ${mint.slice(0, 8)}...: ${leaders} early (potential leaders), ${followers} mid (potential followers)`);
   }
 
   private updateEarlyMetrics(tracker: TokenEarlyMetrics, tx: EarlyTx): void {
@@ -967,6 +920,7 @@ export class MeteoraDammV2CopyBot {
     console.log(`[Bot] Leader wallet: ${this.leader}`);
     console.log(`[Bot] Bot wallet: ${this.trader.ownerPubkey.toBase58()}`);
     console.log(`[Bot] TP1: ${this.config.tp1Trigger ?? 1.5}x (${this.config.tp1SellPercent ?? 50}%) | TP2: ${this.config.tp2Trigger ?? 3.0}x (100%) | SL: ${this.config.slTrigger ?? 0.5}x`);
+    console.log(`[Bot] Wallets will be learned from token mints during evaluation`);
     console.log(`[Bot] Connecting to WebSocket...`);
 
     this.connectWebSocket();
@@ -1603,9 +1557,9 @@ export class MeteoraDammV2CopyBot {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
           
-          // Learn wallets from TOKEN_ACCOUNT_LEADER's token account for this mint
+          // Learn wallets from token mint (first 10 txs)
           if (this.config.tokenAccountSlLeader) {
-            this.learnWalletsFromToken(mint, this.config.tokenAccountSlLeader).catch(err => {
+            this.learnWalletsFromMint(mint, this.config.tokenAccountSlLeader).catch(err => {
               console.error(`[Wallet] Error learning wallets: ${err.message}`);
             });
           }
