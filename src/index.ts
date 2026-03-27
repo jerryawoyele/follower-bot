@@ -615,8 +615,11 @@ export class MeteoraDammV2CopyBot {
       const resp = await fetch(url);
       if (!resp.ok) return null;
       
-      const data = await resp.json() as any[];
-      const tokenAccount = data.find((b: any) => b.mint === mint);
+      const data = await resp.json() as any;
+      
+      // Helius returns { tokens: [...] } or direct array depending on endpoint
+      const tokens = Array.isArray(data) ? data : (data.tokens ?? []);
+      const tokenAccount = tokens.find((b: any) => b.mint === mint);
       
       if (tokenAccount?.tokenAccount) {
         this.tokenAccountCache.set(cacheKey, tokenAccount.tokenAccount);
@@ -726,13 +729,65 @@ export class MeteoraDammV2CopyBot {
     }
   }
 
+  // Batch get token accounts for multiple mints
+  private async batchGetTokenAccounts(mints: string[], owner: string): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    
+    // Filter out cached ones first
+    const uncached: string[] = [];
+    for (const mint of mints) {
+      const cacheKey = `${mint}:${owner}`;
+      const cached = this.tokenAccountCache.get(cacheKey);
+      if (cached) {
+        result.set(mint, cached);
+      } else {
+        uncached.push(mint);
+      }
+    }
+    
+    if (uncached.length === 0) return result;
+    
+    try {
+      // Single API call for all balances
+      const url = `${HELIUS_BASE}/addresses/${owner}/balances?api-key=${this.heliusApiKey}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return result;
+      
+      const data = await resp.json() as any;
+      const tokens = Array.isArray(data) ? data : (data.tokens ?? []);
+      
+      // Build lookup map
+      for (const token of tokens) {
+        if (token.mint && token.tokenAccount) {
+          const cacheKey = `${token.mint}:${owner}`;
+          this.tokenAccountCache.set(cacheKey, token.tokenAccount);
+          result.set(token.mint, token.tokenAccount);
+        }
+      }
+      
+      return result;
+    } catch (err: any) {
+      console.error(`[Wallet] Error batch getting token accounts: ${err.message}`);
+      return result;
+    }
+  }
+
   // Learn wallets from a successful token
   private async learnWalletsFromToken(mint: string, tokenAccountLeader: string): Promise<void> {
+    // Check if we already learned from this mint
+    const learnedKey = `learned:${mint}`;
+    if (this.tokenAccountCache.has(learnedKey)) {
+      return; // Already processed
+    }
+    
     const tokenAccount = await this.getTokenAccount(mint, tokenAccountLeader);
     if (!tokenAccount) {
       console.log(`[Wallet] No token account found for ${mint.slice(0, 8)}... owner=${tokenAccountLeader.slice(0, 8)}...`);
       return;
     }
+    
+    // Mark as learned
+    this.tokenAccountCache.set(learnedKey, tokenAccount);
     
     console.log(`[Wallet] 📚 Learning wallets from token ${mint.slice(0, 8)}... (tokenAccount: ${tokenAccount.slice(0, 8)}...)`);
     
