@@ -135,8 +135,17 @@ type TokenEarlyMetrics = {
   firstSellAtMs?: number;
 
   score: number;
-  decision: "good" | "bad" | "pending" | "none";
+  decision: "good" | "bad" | "pending" | "watchlist" | "none";
   evaluated: boolean;
+  
+  // Two-stage entry system
+  stage: 1 | 2; // Stage 1 = early structure, Stage 2 = momentum confirmation
+  stage1Score?: number; // Score from stage 1
+  stage1Decision?: "good" | "bad" | "pending" | "watchlist";
+  stage2Confirmations: number; // Count of confirmation signals
+  priceHigh?: number; // Highest price seen (for breakout detection)
+  consecutiveBuySamples: number; // Pool samples with consecutive buy pressure
+  walletAcceleration: number; // Rate of new unique wallets
 };
 
 // Pool snapshot for monitoring
@@ -568,6 +577,11 @@ export class MeteoraDammV2CopyBot {
       score: 0,
       decision: "none",
       evaluated: false,
+      // Two-stage entry
+      stage: 1,
+      stage2Confirmations: 0,
+      consecutiveBuySamples: 0,
+      walletAcceleration: 0,
     };
   }
 
@@ -681,10 +695,68 @@ export class MeteoraDammV2CopyBot {
     return score;
   }
 
-  private classifyEarlyToken(score: number): "good" | "bad" | "pending" {
+  private classifyEarlyToken(score: number, tracker: TokenEarlyMetrics): "good" | "bad" | "pending" | "watchlist" {
+    const uniqueWalletRatio = tracker.uniqueWallets.size / Math.max(tracker.txs.length, 1);
+    const classified = tracker.buyCount + tracker.sellCount;
+    const buyRatio = classified > 0 ? tracker.buyCount / classified : 0;
+    
+    // Good: clean early swarm
     if (score >= 60) return "good";
-    if (score < 30) return "bad";
-    return "pending";
+    
+    // Watchlist: insider presence but mixed early tape
+    // Keep alive for stage 2 confirmation
+    if (score >= 30 && score < 60) {
+      if (tracker.knownWalletHits >= 3 && uniqueWalletRatio >= 0.5) {
+        return "watchlist"; // Has insider presence, worth watching
+      }
+      return "pending";
+    }
+    
+    // Bad: weak participation and weak structure
+    return "bad";
+  }
+
+  // Stage 2 confirmation: check for momentum signals after stage 1
+  private checkStage2Confirmation(tracker: TokenEarlyMetrics, snapshot: PoolSnapshot, buyPressure: boolean): boolean {
+    if (tracker.stage !== 2) return false;
+    
+    let confirmed = false;
+    
+    // Track price high for breakout detection
+    if (!tracker.priceHigh || snapshot.price > tracker.priceHigh) {
+      tracker.priceHigh = snapshot.price;
+      
+      // Price breakout = confirmation
+      if (tracker.priceHigh > snapshot.price * 1.1) {
+        tracker.stage2Confirmations++;
+        console.log(`[EarlyScore] 📈 Stage 2 confirmation: Price breakout for ${tracker.tokenMint.slice(0, 8)}... (confirms=${tracker.stage2Confirmations})`);
+        confirmed = true;
+      }
+    }
+    
+    // Track consecutive buy samples
+    if (buyPressure) {
+      tracker.consecutiveBuySamples++;
+      if (tracker.consecutiveBuySamples >= 3) {
+        tracker.stage2Confirmations++;
+        console.log(`[EarlyScore] 📈 Stage 2 confirmation: Consecutive buys for ${tracker.tokenMint.slice(0, 8)}... (confirms=${tracker.stage2Confirmations})`);
+        confirmed = true;
+      }
+    } else {
+      tracker.consecutiveBuySamples = 0;
+    }
+    
+    // Track wallet acceleration (new unique wallets per tx)
+    const prevUniqueCount = tracker.uniqueWallets.size;
+    const acceleration = prevUniqueCount > 0 ? (tracker.uniqueWallets.size - prevUniqueCount) / prevUniqueCount : 0;
+    if (acceleration > 0.1) {
+      tracker.walletAcceleration = acceleration;
+      tracker.stage2Confirmations++;
+      console.log(`[EarlyScore] 📈 Stage 2 confirmation: Wallet acceleration for ${tracker.tokenMint.slice(0, 8)}... (confirms=${tracker.stage2Confirmations})`);
+      confirmed = true;
+    }
+    
+    return confirmed;
   }
 
   private shouldEvaluateEarly(tracker: TokenEarlyMetrics, now: number): boolean {
@@ -1377,7 +1449,7 @@ export class MeteoraDammV2CopyBot {
         if (this.shouldEvaluateEarly(tracker, now) && !tracker.evaluated) {
           const score = this.scoreToken(tracker, now);
           tracker.score = score;
-          tracker.decision = this.classifyEarlyToken(score);
+          tracker.decision = this.classifyEarlyToken(score, tracker);
           
           const elapsedSec = Math.round((now - tracker.startedAt) / 1000);
           const txPerSec = (tracker.txs.length / Math.max(elapsedSec, 1)).toFixed(1);
@@ -1386,24 +1458,56 @@ export class MeteoraDammV2CopyBot {
             ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
             : "0.00";
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision}`);
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} decision=${tracker.decision} stage=${tracker.stage}`);
 
-          // ===== DECISION FLOW =====
-          if (tracker.decision === "good" && tracker.txs.length >= 30) {
-            // GOOD: Trigger buy
-            console.log(`[Bot] 🟢 EARLY BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
-            this.pendingPositions.delete(mint);
-            this.attemptedBuys.add(mint);
-            await this.copyBuyFromPending(pending);
-            continue;
-          } else if (tracker.decision === "bad") {
-            // BAD: Stop tracking
-            console.log(`[Bot] 🔴 EARLY REJECT: ${mint.slice(0, 8)}... (score=${score})`);
-            tracker.evaluated = true;
-          } else if (tracker.txs.length >= 200 || elapsedSec >= 60) {
-            // TIMEOUT: Stop tracking
-            console.log(`[Bot] ⏸️ EARLY TIMEOUT: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
-            tracker.evaluated = true;
+          // ===== STAGE 1: Early Structure Decision =====
+          if (tracker.stage === 1) {
+            if (tracker.decision === "good" && tracker.txs.length >= 30) {
+              // GOOD: Trigger buy immediately
+              console.log(`[Bot] 🟢 STAGE 1 BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
+              this.pendingPositions.delete(mint);
+              this.attemptedBuys.add(mint);
+              await this.copyBuyFromPending(pending);
+              continue;
+            } else if (tracker.decision === "watchlist") {
+              // WATCHLIST: Move to stage 2 for momentum confirmation
+              tracker.stage = 2;
+              tracker.stage1Score = score;
+              tracker.stage1Decision = "watchlist";
+              console.log(`[Bot] 🟡 STAGE 1 → STAGE 2: ${mint.slice(0, 8)}... (insider presence, watching for momentum)`);
+            } else if (tracker.decision === "bad") {
+              // BAD: Stop tracking
+              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (score=${score})`);
+              tracker.evaluated = true;
+            } else if (tracker.decision === "pending" && tracker.txs.length >= 80) {
+              // PENDING at 80 txs: Move to stage 2 for extended watch
+              tracker.stage = 2;
+              tracker.stage1Score = score;
+              tracker.stage1Decision = "pending";
+              console.log(`[Bot] 🟠 STAGE 1 → STAGE 2: ${mint.slice(0, 8)}... (pending, extended watch)`);
+            }
+          }
+          
+          // ===== STAGE 2: Momentum Confirmation =====
+          if (tracker.stage === 2) {
+            // Check for confirmation signals
+            this.checkStage2Confirmation(tracker, snapshot, buyPressure);
+            
+            // Require 2+ confirmations to promote to good
+            if (tracker.stage2Confirmations >= 2) {
+              console.log(`[Bot] 🟢 STAGE 2 BUY: ${mint.slice(0, 8)}... (confirmations=${tracker.stage2Confirmations})`);
+              tracker.decision = "good";
+              this.pendingPositions.delete(mint);
+              this.attemptedBuys.add(mint);
+              await this.copyBuyFromPending(pending);
+              continue;
+            }
+            
+            // Timeout for stage 2
+            if (tracker.txs.length >= 200 || elapsedSec >= 120) {
+              console.log(`[Bot] ⏸️ STAGE 2 TIMEOUT: ${mint.slice(0, 8)}... (confirmations=${tracker.stage2Confirmations})`);
+              tracker.evaluated = true;
+            }
           }
         }
 
