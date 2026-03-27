@@ -1596,11 +1596,14 @@ export class MeteoraDammV2CopyBot {
             if (poolTx.wallet) {
               const isLeader = this.leaderWalletSet.has(poolTx.wallet);
               const isFollower = this.followerWalletSet.has(poolTx.wallet);
+              const isInsider = this.insiderWalletSet.has(poolTx.wallet);
               
               if (isLeader) {
                 console.log(`[EarlyScore] 🟨 LEADER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
               } else if (isFollower) {
                 console.log(`[EarlyScore] 🟦 FOLLOWER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
+              } else if (isInsider) {
+                console.log(`[EarlyScore] 🟪 INSIDER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
               } else {
                 // Log first 10 unknown wallets to see what we're getting
                 if (tracker.uniqueWallets.size <= 10) {
