@@ -253,6 +253,10 @@ type FollowState = {
   insiderBuysSinceEntry: number; // Insider buys after bot entry
   insiderSellsSinceEntry: number; // Insider sells after bot entry
   lastInsiderActivity?: { wallet: string; side: "buy" | "sell"; timestamp: number };
+  // Insider momentum tracking (rate of insider buys per interval)
+  insiderBuysThisInterval: number; // Insider buys in current interval
+  insiderBuysPrevInterval: number; // Insider buys in previous interval
+  peakInsiderBuyRate: number; // Highest insider buy rate seen
 };
 
 // Helius API types
@@ -2019,6 +2023,9 @@ export class MeteoraDammV2CopyBot {
         }
 
         // ===== INSIDER MOVEMENT TRACKING =====
+        // Track insider buy rate per interval for momentum decay detection
+        const prevInsiderBuysThisInterval = position.insiderBuysThisInterval;
+        
         // Fetch recent pool transactions to detect insider activity
         try {
           const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
@@ -2032,7 +2039,8 @@ export class MeteoraDammV2CopyBot {
                 
                 if (tx.side === "buy") {
                   position.insiderBuysSinceEntry++;
-                  console.log(`[Pool] 🟪 INSIDER BUY: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total insider buys: ${position.insiderBuysSinceEntry})`);
+                  position.insiderBuysThisInterval++; // Track per interval
+                  console.log(`[Pool] 🟪 INSIDER BUY: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total: ${position.insiderBuysSinceEntry}, thisInterval: ${position.insiderBuysThisInterval})`);
                   position.lastInsiderActivity = {
                     wallet: tx.wallet,
                     side: "buy",
@@ -2053,6 +2061,33 @@ export class MeteoraDammV2CopyBot {
         } catch (err) {
           // Silently continue if fetch fails
         }
+        
+        // Track peak insider buy rate
+        if (position.insiderBuysThisInterval > position.peakInsiderBuyRate) {
+          position.peakInsiderBuyRate = position.insiderBuysThisInterval;
+        }
+        
+        // At end of interval tracking, shift to prev and reset
+        // This happens naturally each pool check (every ~2s)
+        if (position.insiderBuysThisInterval !== prevInsiderBuysThisInterval) {
+          // We had new insider buys this check, update prev for next comparison
+          position.insiderBuysPrevInterval = prevInsiderBuysThisInterval > 0 ? prevInsiderBuysThisInterval : position.insiderBuysThisInterval;
+        }
+        
+        // INSIDER MOMENTUM DECAY EXIT: If insider buy rate dropped from 6+ to <=3
+        const insiderMomentumDecay = 
+          position.peakInsiderBuyRate >= 6 && 
+          position.insiderBuysThisInterval <= 3 &&
+          position.insiderBuysPrevInterval >= 4; // Was strong, now weak
+        
+        if (insiderMomentumDecay && position.highestProfit > 0) {
+          console.log(`[Bot] 🟪 INSIDER MOMENTUM DECAY: ${mint.slice(0, 8)}... (peak=${position.peakInsiderBuyRate} → thisInterval=${position.insiderBuysThisInterval}, profit=${position.highestProfit.toFixed(1)}%)`);
+          await this.copySell(mint, "INSIDER_MOMENTUM_DECAY", 100);
+          continue;
+        }
+        
+        // Reset insider buys this interval for next check
+        position.insiderBuysThisInterval = 0;
 
         // Calculate profit
         if (position.entryPrice && position.entryPrice > 0) {
@@ -2325,6 +2360,10 @@ export class MeteoraDammV2CopyBot {
       insiderBuysSinceEntry: 0,
       insiderSellsSinceEntry: 0,
       lastInsiderActivity: undefined,
+      // Insider momentum tracking
+      insiderBuysThisInterval: 0,
+      insiderBuysPrevInterval: 0,
+      peakInsiderBuyRate: 0,
     });
 
     console.log(
@@ -2646,6 +2685,10 @@ export class MeteoraDammV2CopyBot {
       insiderBuysSinceEntry: 0,
       insiderSellsSinceEntry: 0,
       lastInsiderActivity: undefined,
+      // Insider momentum tracking
+      insiderBuysThisInterval: 0,
+      insiderBuysPrevInterval: 0,
+      peakInsiderBuyRate: 0,
     });
 
     console.log(
