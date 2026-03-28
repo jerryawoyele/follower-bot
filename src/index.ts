@@ -1540,16 +1540,40 @@ export class MeteoraDammV2CopyBot {
           const first = tx.tokenTransfers[0];
           const second = tx.tokenTransfers[1];
           
-          if (first.mint === SOL_MINT) {
-            // SOL out = BUY (user swapping SOL for token)
-            side = "buy";
-            amount = first.tokenAmount || 0;
-            wallet = first.fromUserAccount;
-          } else if (second.mint === SOL_MINT) {
-            // SOL in = SELL (user swapping token for SOL)
-            side = "sell";
-            amount = second.tokenAmount || 0;
-            wallet = first.fromUserAccount;
+          // Check if SOL is involved in either transfer
+          const solTransfer = first.mint === SOL_MINT ? first : second.mint === SOL_MINT ? second : null;
+          const tokenTransfer = first.mint !== SOL_MINT ? first : second.mint !== SOL_MINT ? second : null;
+          
+          if (solTransfer && tokenTransfer) {
+            // Determine direction based on who is sending SOL
+            if (solTransfer.fromUserAccount && solTransfer.toUserAccount) {
+              // If SOL is going TO the pool address, it's a BUY
+              // If SOL is coming FROM the pool address, it's a SELL
+              if (solTransfer.toUserAccount === poolAddress) {
+                side = "buy";
+                amount = solTransfer.tokenAmount || 0;
+                wallet = solTransfer.fromUserAccount;
+              } else if (solTransfer.fromUserAccount === poolAddress) {
+                side = "sell";
+                amount = solTransfer.tokenAmount || 0;
+                wallet = tokenTransfer.fromUserAccount;
+                console.log(`[Pool] 🟢 DETECTED SELL via tokenTransfers: ${tx.signature.slice(0, 8)}... SOL from pool, wallet=${wallet?.slice(0, 8)}`);
+              } else {
+                // Neither from nor to is pool - check token transfer direction
+                // If token is going TO pool, it's a SELL
+                if (tokenTransfer.toUserAccount === poolAddress) {
+                  side = "sell";
+                  amount = solTransfer.tokenAmount || 0;
+                  wallet = tokenTransfer.fromUserAccount;
+                  console.log(`[Pool] 🟢 DETECTED SELL via token to pool: ${tx.signature.slice(0, 8)}... token to pool, wallet=${wallet?.slice(0, 8)}`);
+                } else {
+                  // Default to buy
+                  side = "buy";
+                  amount = solTransfer.tokenAmount || 0;
+                  wallet = solTransfer.fromUserAccount;
+                }
+              }
+            }
           }
         }
         
@@ -1573,6 +1597,14 @@ export class MeteoraDammV2CopyBot {
               side = "sell";
               amount = transfer.amount;
               break;
+            }
+          }
+          
+          // Debug: log if still unknown but has native transfers
+          if (side === "unknown" && tx.nativeTransfers.length > 0) {
+            const hasLargeTransfer = tx.nativeTransfers.some((t: any) => t.amount >= 10000);
+            if (hasLargeTransfer) {
+              console.log(`[Pool] 🔍 Unknown side tx ${tx.signature.slice(0, 8)}... nativeTransfers: ${JSON.stringify(tx.nativeTransfers.map((t: any) => ({ from: t.fromUserAccount?.slice(0, 8), to: t.toUserAccount?.slice(0, 8), amt: t.amount })))}`);
             }
           }
         }
