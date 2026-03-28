@@ -151,10 +151,6 @@ type TokenEarlyMetrics = {
   decision: "good" | "bad" | "pending" | "watchlist" | "none";
   evaluated: boolean;
   
-  // Fetch tracking for retry logic
-  firstFetchAt?: number; // Timestamp of first fetch attempt
-  retryFetchDone?: boolean; // Whether retry was attempted
-  
   // State machine for sophisticated classification
   state: TokenState;
   prevKnownHits: number; // Known hits from previous check (for delta)
@@ -1417,7 +1413,7 @@ export class MeteoraDammV2CopyBot {
     const url = new URL(`https://api-mainnet.helius-rpc.com/v0/addresses/${position.leaderTokenAccount}/transactions`);
     url.searchParams.set("api-key", this.heliusApiKey);
     url.searchParams.set("token-accounts", "none");
-    url.searchParams.set("sort-order", "asc");
+    url.searchParams.set("sort-order", "desc");
     
     if (position.lastCheckedSignature) {
       url.searchParams.set("after-signature", position.lastCheckedSignature);
@@ -1511,96 +1507,6 @@ export class MeteoraDammV2CopyBot {
     } catch (err: any) {
       console.error(`[Pool] Error fetching pool ${poolAddress.slice(0, 8)}...: ${err.message}`);
       return null;
-    }
-  }
-
-  // Fetch transactions for a token mint (not pool) with wallet addresses
-  // Filters out txs with amount 115624 (likely airdrops/fees)
-  // Fetches up to 250 txs in ONE request
-  private async fetchTokenTransactions(mint: string): Promise<PoolTx[]> {
-    try {
-      const url = new URL(`${HELIUS_BASE}/addresses/${mint}/transactions`);
-      url.searchParams.set("api-key", this.heliusApiKey);
-      url.searchParams.set("limit", "250"); // Fetch all 250 at once
-      
-      const resp = await fetch(url.toString());
-      if (!resp.ok) return [];
-      
-      const txs = await resp.json() as any[];
-      const result: PoolTx[] = [];
-      
-      for (const tx of txs) {
-        // Determine side from tokenTransfers
-        let side: "buy" | "sell" | "unknown" = "unknown";
-        let amount = 0;
-        let wallet: string | undefined;
-        
-        // Find the token transfer for this mint
-        if (tx.tokenTransfers) {
-          for (const transfer of tx.tokenTransfers) {
-            if (transfer.mint === mint) {
-              amount = transfer.tokenAmount || 0;
-              
-              // Filter out txs with amount 115624 (airdrops/fees)
-              if (amount === 115624) {
-                side = "unknown";
-                continue;
-              }
-              
-              wallet = transfer.fromUserAccount;
-              
-              // Check if this is a buy or sell by looking for SOL transfer
-              const solTransfer = tx.tokenTransfers?.find((t: any) => t.mint === SOL_MINT);
-              if (solTransfer) {
-                // If SOL is going out from wallet, it's a BUY
-                if (solTransfer.fromUserAccount === wallet) {
-                  side = "buy";
-                } else {
-                  // If SOL is coming to wallet, it's a SELL
-                  side = "sell";
-                }
-              } else {
-                // No SOL transfer - check native transfers
-                if (tx.nativeTransfers) {
-                  for (const native of tx.nativeTransfers) {
-                    if (native.amount >= 10000) { // Skip tiny amounts
-                      if (native.fromUserAccount === wallet) {
-                        side = "buy";
-                        break;
-                      } else if (native.toUserAccount === wallet) {
-                        side = "sell";
-                        break;
-                      }
-                    }
-                  }
-                }
-              }
-              break;
-            }
-          }
-        }
-        
-        // Skip if we couldn't determine side or amount is filtered
-        if (side === "unknown") continue;
-        
-        // Fallback: use feePayer as wallet if not found
-        if (!wallet && tx.feePayer) {
-          wallet = tx.feePayer;
-        }
-        
-        result.push({
-          signature: tx.signature,
-          timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
-          wallet,
-          side,
-          amount,
-        });
-      }
-      
-      return result;
-    } catch (err: any) {
-      console.error(`[Token] Error fetching txs for ${mint.slice(0, 8)}...: ${err.message}`);
-      return [];
     }
   }
 
@@ -1743,92 +1649,76 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        // ===== FETCH ALL 250 TOKEN TRANSACTIONS AT ONCE =====
+        // ===== FETCH FULL 250 POOL TRANSACTIONS IMMEDIATELY =====
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
-          console.log(`[EarlyScore] 🔄 Fetching 250 token txs at once for ${mint.slice(0, 8)}...`);
+          console.log(`[EarlyScore] 🔄 Fetching first 250 pool txs for ${mint.slice(0, 8)}...`);
         }
 
-        // Fetch all 250 txs from TOKEN MINT address in ONE request (only once)
-        // If token is brand new, wait before retrying
-        const timeSinceFirstFetch = tracker.firstFetchAt ? Date.now() - tracker.firstFetchAt : 0;
-        const RETRY_DELAY = 30000; // 30 seconds before retry
-        
-        if (!tracker.evaluated && tracker.txs.length === 0 && !tracker.firstFetchAt) {
-          // First fetch attempt
-          tracker.firstFetchAt = Date.now();
-          const tokenTxs = await this.fetchTokenTransactions(mint);
+        // Fetch full 250 txs from pool address using pagination (if not done yet)
+        if (!tracker.evaluated && tracker.txs.length < 250) {
+          // Keep fetching batches until we have 250 txs
+          let beforeSignature: string | undefined = undefined;
+          let totalFetched = 0;
+          let totalDups = 0;
           
-          let validTxs = 0;
-          
-          for (const tokenTx of tokenTxs) {
-            if (tracker.seenSignatures.has(tokenTx.signature)) continue;
-            tracker.seenSignatures.add(tokenTx.signature);
-            validTxs++;
+          while (tracker.txs.length < 250) {
+            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, beforeSignature);
+            if (poolTxs.length === 0) break; // No more txs available
             
-            const earlyTx: EarlyTx = {
-              signature: tokenTx.signature,
-              ts: tokenTx.timestamp * 1000,
-              from: tokenTx.wallet,
-              side: tokenTx.side,
-              amount: tokenTx.amount,
-            };
-            this.updateEarlyMetrics(tracker, earlyTx);
+            let newTxs = 0;
+            let dupTxs = 0;
             
-            // Log insider wallets (buy or sell)
-            if (tokenTx.wallet && this.insiderWalletSet.has(tokenTx.wallet)) {
-              console.log(`[EarlyScore] 🟪 INSIDER ${tokenTx.side.toUpperCase()}: ${tokenTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+            for (const poolTx of poolTxs) {
+              // Deduplicate by signature
+              if (tracker.seenSignatures.has(poolTx.signature)) {
+                dupTxs++;
+                continue;
+              }
+              tracker.seenSignatures.add(poolTx.signature);
+              newTxs++;
+              
+              const earlyTx: EarlyTx = {
+                signature: poolTx.signature,
+                ts: poolTx.timestamp * 1000,
+                from: poolTx.wallet,
+                side: poolTx.side,
+                amount: poolTx.amount,
+              };
+              this.updateEarlyMetrics(tracker, earlyTx);
+              
+              // Log insider wallets (buy or sell)
+              if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
+                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()}: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+              }
+              
+              // Stop at 250
+              if (tracker.txs.length >= 250) break;
             }
-          }
-          
-          console.log(`[EarlyScore] 📊 Fetched: ${tokenTxs.length} txs | Valid (non-115624): ${validTxs} | Total tracked: ${tracker.txs.length}`);
-          
-          // If still 0 txs, token is brand new - will retry after delay
-          if (tracker.txs.length === 0) {
-            console.log(`[Bot] ⏳ ${mint.slice(0, 8)}... Token is BRAND NEW (0 txs), will retry in ${RETRY_DELAY/1000}s`);
-          }
-        } else if (tracker.txs.length === 0 && timeSinceFirstFetch >= RETRY_DELAY && !tracker.retryFetchDone) {
-          // Retry fetch after delay (token might have txs now)
-          console.log(`[EarlyScore] 🔄 Retrying fetch for ${mint.slice(0, 8)}... after ${RETRY_DELAY/1000}s`);
-          tracker.retryFetchDone = true;
-          
-          const tokenTxs = await this.fetchTokenTransactions(mint);
-          
-          let validTxs = 0;
-          for (const tokenTx of tokenTxs) {
-            if (tracker.seenSignatures.has(tokenTx.signature)) continue;
-            tracker.seenSignatures.add(tokenTx.signature);
-            validTxs++;
             
-            const earlyTx: EarlyTx = {
-              signature: tokenTx.signature,
-              ts: tokenTx.timestamp * 1000,
-              from: tokenTx.wallet,
-              side: tokenTx.side,
-              amount: tokenTx.amount,
-            };
-            this.updateEarlyMetrics(tracker, earlyTx);
+            totalFetched += poolTxs.length;
+            totalDups += dupTxs;
             
-            if (tokenTx.wallet && this.insiderWalletSet.has(tokenTx.wallet)) {
-              console.log(`[EarlyScore] 🟪 INSIDER ${tokenTx.side.toUpperCase()}: ${tokenTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+            // Set cursor for next batch (oldest tx signature)
+            if (poolTxs.length > 0) {
+              beforeSignature = poolTxs[poolTxs.length - 1].signature;
             }
+            
+            // Log batch progress
+            console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250`);
+            
+            // Break if no new txs were added (reached end of history)
+            if (newTxs === 0) break;
           }
           
-          console.log(`[EarlyScore] 📊 Retry fetch: ${tokenTxs.length} txs | Valid: ${validTxs} | Total tracked: ${tracker.txs.length}`);
-          
-          // If still 0 after retry, reject
-          if (tracker.txs.length === 0) {
-            console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (0 txs after retry, token may be broken)`);
-            tracker.evaluated = true;
-            continue;
-          }
+          console.log(`[EarlyScore] � Done fetching: ${tracker.txs.length} unique txs (total fetched: ${totalFetched}, dups skipped: ${totalDups})`);
         }
 
-        // Check if we have enough txs - make buy decision
+        // Check if we have 250 txs - make buy decision
         if (tracker.txs.length >= 250 && !tracker.evaluated) {
-          // Count insider txs (both buy AND sell) from FULL token activity
+          // Count insider txs (both buy AND sell) from FULL pool activity
           const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
           const insiderPercent = (insiderTxCount / tracker.txs.length) * 100;
           
@@ -1836,8 +1726,8 @@ export class MeteoraDammV2CopyBot {
           const insiderBuys = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "buy").length;
           const insiderSells = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "sell").length;
           
-          console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... HAVE ${tracker.txs.length} TOKEN TXS`);
-          console.log(`[EarlyScore] 📊 DOMINANCE: totalTokenTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | dominancePct=${insiderPercent.toFixed(1)}%`);
+          console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... HAVE ${tracker.txs.length} POOL TXS`);
+          console.log(`[EarlyScore] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | dominancePct=${insiderPercent.toFixed(1)}%`);
           
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
@@ -1854,16 +1744,9 @@ export class MeteoraDammV2CopyBot {
           }
         }
         
-        // If we have some txs but < 250, reject (not enough data)
-        if (tracker.txs.length > 0 && tracker.txs.length < 250 && !tracker.evaluated) {
-          console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (only ${tracker.txs.length} txs, need 250 for accurate dominance)`);
-          tracker.evaluated = true;
-          continue;
-        }
-        
-        // Waiting for retry delay (silent - don't spam logs)
-        if (tracker.txs.length === 0 && !tracker.retryFetchDone && timeSinceFirstFetch < RETRY_DELAY) {
-          // Silent - avoid log spam
+        // If we couldn't get 250 txs (pool too new), reject
+        if (tracker.txs.length < 250 && !tracker.evaluated) {
+          console.log(`[Bot] ⏳ ${mint.slice(0, 8)}... Only ${tracker.txs.length} txs in pool, waiting...`);
         }
 
         pending.prevPoolSnapshot = snapshot;
