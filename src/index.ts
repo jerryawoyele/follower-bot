@@ -142,6 +142,7 @@ type TokenEarlyMetrics = {
   seenSignatures: Set<string>; // Deduplication - signatures already processed
   rawFetchedCount: number; // Total fetched from API
   duplicateCount: number; // Duplicates skipped
+  lastFetchedSignature?: string; // Cursor for pagination (oldest signature fetched)
 
   amounts: number[];
   firstSellAtTx?: number;
@@ -630,6 +631,7 @@ export class MeteoraDammV2CopyBot {
       seenSignatures: new Set(),
       rawFetchedCount: 0,
       duplicateCount: 0,
+      lastFetchedSignature: undefined,
       amounts: [],
       score: 0,
       decision: "none",
@@ -1681,7 +1683,7 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        // ===== FETCH FULL 250 POOL TRANSACTIONS IMMEDIATELY =====
+        // ===== FETCH FULL 250 POOL TRANSACTIONS IN ONE GO =====
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
@@ -1689,16 +1691,20 @@ export class MeteoraDammV2CopyBot {
           console.log(`[EarlyScore] 🔄 Fetching first 250 pool txs for ${mint.slice(0, 8)}...`);
         }
 
-        // Fetch full 250 txs from pool address using pagination (if not done yet)
+        // Fetch all 250 txs in one blocking call (if not done yet)
         if (!tracker.evaluated && tracker.txs.length < 250) {
-          // Keep fetching batches until we have 250 txs
-          let beforeSignature: string | undefined = undefined;
+          // Use stored cursor for pagination
+          let beforeSignature: string | undefined = tracker.lastFetchedSignature;
           let totalFetched = 0;
           let totalDups = 0;
           
+          // Keep fetching until we have 250 unique txs
           while (tracker.txs.length < 250) {
             const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, beforeSignature);
-            if (poolTxs.length === 0) break; // No more txs available
+            if (poolTxs.length === 0) {
+              console.log(`[EarlyScore] ⚠️ No more txs available, have ${tracker.txs.length}/250`);
+              break;
+            }
             
             let newTxs = 0;
             let dupTxs = 0;
@@ -1733,9 +1739,10 @@ export class MeteoraDammV2CopyBot {
             totalFetched += poolTxs.length;
             totalDups += dupTxs;
             
-            // Set cursor for next batch (oldest tx signature)
+            // Store cursor for next batch (oldest tx signature)
             if (poolTxs.length > 0) {
               beforeSignature = poolTxs[poolTxs.length - 1].signature;
+              tracker.lastFetchedSignature = beforeSignature;
             }
             
             // Log batch progress
@@ -1745,7 +1752,7 @@ export class MeteoraDammV2CopyBot {
             if (newTxs === 0) break;
           }
           
-          console.log(`[EarlyScore] � Done fetching: ${tracker.txs.length} unique txs (total fetched: ${totalFetched}, dups skipped: ${totalDups})`);
+          console.log(`[EarlyScore] ✅ Done fetching: ${tracker.txs.length} unique txs (total fetched: ${totalFetched}, dups skipped: ${totalDups})`);
         }
 
         // Check if we have 250 txs - make buy decision
