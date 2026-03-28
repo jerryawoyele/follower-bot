@@ -1512,17 +1512,12 @@ export class MeteoraDammV2CopyBot {
 
   // Fetch transactions for a token mint (not pool) with wallet addresses
   // Filters out txs with amount 115624 (likely airdrops/fees)
-  // Uses cursor-based paging with 'before' parameter
-  private async fetchTokenTransactions(mint: string, beforeSignature?: string): Promise<PoolTx[]> {
+  // Fetches up to 250 txs in ONE request
+  private async fetchTokenTransactions(mint: string): Promise<PoolTx[]> {
     try {
       const url = new URL(`${HELIUS_BASE}/addresses/${mint}/transactions`);
       url.searchParams.set("api-key", this.heliusApiKey);
-      url.searchParams.set("limit", "50");
-      
-      // Use 'before' cursor for pagination - fetches txs older than this signature
-      if (beforeSignature) {
-        url.searchParams.set("before", beforeSignature);
-      }
+      url.searchParams.set("limit", "250"); // Fetch all 250 at once
       
       const resp = await fetch(url.toString());
       if (!resp.ok) return [];
@@ -1744,76 +1739,51 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        // ===== FETCH FULL 250 TOKEN TRANSACTIONS IMMEDIATELY =====
+        // ===== FETCH ALL 250 TOKEN TRANSACTIONS AT ONCE =====
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
-          console.log(`[EarlyScore] 🔄 Fetching first 250 token txs for ${mint.slice(0, 8)}...`);
+          console.log(`[EarlyScore] 🔄 Fetching 250 token txs at once for ${mint.slice(0, 8)}...`);
         }
 
-        // Fetch full 250 txs from TOKEN MINT address using pagination (if not done yet)
-        if (!tracker.evaluated && tracker.txs.length < 250) {
-          // Keep fetching batches until we have 250 txs
-          let beforeSignature: string | undefined = undefined;
-          let totalFetched = 0;
-          let totalDups = 0;
-          let totalFiltered = 0;
+        // Fetch all 250 txs from TOKEN MINT address in ONE request
+        if (!tracker.evaluated && tracker.txs.length === 0) {
+          // Fetch all 250 txs at once
+          const tokenTxs = await this.fetchTokenTransactions(mint);
           
-          while (tracker.txs.length < 250) {
-            // Use TOKEN MINT address, not pool address
-            const tokenTxs = await this.fetchTokenTransactions(mint, beforeSignature);
-            if (tokenTxs.length === 0) break; // No more txs available
-            
-            let newTxs = 0;
-            let dupTxs = 0;
-            
-            for (const tokenTx of tokenTxs) {
-              // Deduplicate by signature
-              if (tracker.seenSignatures.has(tokenTx.signature)) {
-                dupTxs++;
-                continue;
-              }
-              tracker.seenSignatures.add(tokenTx.signature);
-              newTxs++;
-              
-              const earlyTx: EarlyTx = {
-                signature: tokenTx.signature,
-                ts: tokenTx.timestamp * 1000,
-                from: tokenTx.wallet,
-                side: tokenTx.side,
-                amount: tokenTx.amount,
-              };
-              this.updateEarlyMetrics(tracker, earlyTx);
-              
-              // Log insider wallets (buy or sell)
-              if (tokenTx.wallet && this.insiderWalletSet.has(tokenTx.wallet)) {
-                console.log(`[EarlyScore] 🟪 INSIDER ${tokenTx.side.toUpperCase()}: ${tokenTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
-              }
-              
-              // Stop at 250
-              if (tracker.txs.length >= 250) break;
+          let validTxs = 0;
+          let filteredTxs = 0;
+          
+          for (const tokenTx of tokenTxs) {
+            // Skip if already seen (shouldn't happen with fresh fetch)
+            if (tracker.seenSignatures.has(tokenTx.signature)) {
+              continue;
             }
+            tracker.seenSignatures.add(tokenTx.signature);
             
-            totalFetched += tokenTxs.length;
-            totalDups += dupTxs;
+            // Count valid txs (filtered amounts already handled in fetchTokenTransactions)
+            validTxs++;
             
-            // Set cursor for next batch (oldest tx signature)
-            if (tokenTxs.length > 0) {
-              beforeSignature = tokenTxs[tokenTxs.length - 1].signature;
+            const earlyTx: EarlyTx = {
+              signature: tokenTx.signature,
+              ts: tokenTx.timestamp * 1000,
+              from: tokenTx.wallet,
+              side: tokenTx.side,
+              amount: tokenTx.amount,
+            };
+            this.updateEarlyMetrics(tracker, earlyTx);
+            
+            // Log insider wallets (buy or sell)
+            if (tokenTx.wallet && this.insiderWalletSet.has(tokenTx.wallet)) {
+              console.log(`[EarlyScore] 🟪 INSIDER ${tokenTx.side.toUpperCase()}: ${tokenTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
             }
-            
-            // Log batch progress
-            console.log(`[EarlyScore] 📦 Batch: fetched=${tokenTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250`);
-            
-            // Break if no new txs were added (reached end of history)
-            if (newTxs === 0) break;
           }
           
-          console.log(`[EarlyScore] 📊 Done fetching: ${tracker.txs.length} unique txs (fetched: ${totalFetched}, dups: ${totalDups}, filtered 115624 amounts)`);
+          console.log(`[EarlyScore] � Fetched: ${tokenTxs.length} txs | Valid (non-115624): ${validTxs} | Total tracked: ${tracker.txs.length}`);
         }
 
-        // Check if we have 250 txs - make buy decision
+        // Check if we have enough txs - make buy decision
         if (tracker.txs.length >= 250 && !tracker.evaluated) {
           // Count insider txs (both buy AND sell) from FULL token activity
           const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
