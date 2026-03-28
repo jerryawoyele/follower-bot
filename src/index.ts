@@ -1654,6 +1654,7 @@ export class MeteoraDammV2CopyBot {
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
+          console.log(`[EarlyScore] 🔄 Starting tx collection for ${mint.slice(0, 8)}... (need 250 txs)`);
         }
 
         // Fetch until we have 250 txs
@@ -1661,8 +1662,13 @@ export class MeteoraDammV2CopyBot {
           const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
           
           let newTxs = 0;
+          let dupTxs = 0;
           for (const poolTx of poolTxs) {
-            if (tracker.seenSignatures.has(poolTx.signature)) continue;
+            // Deduplicate by signature
+            if (tracker.seenSignatures.has(poolTx.signature)) {
+              dupTxs++;
+              continue;
+            }
             tracker.seenSignatures.add(poolTx.signature);
             newTxs++;
             
@@ -1675,25 +1681,38 @@ export class MeteoraDammV2CopyBot {
             };
             this.updateEarlyMetrics(tracker, earlyTx);
             
-            // Log insider wallets
+            // Log insider wallets (buy or sell)
             if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
-              console.log(`[EarlyScore] 🟪 INSIDER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
+              console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()}: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
             }
           }
           
-          console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs: ${newTxs} new (total: ${tracker.txs.length})`);
+          // Log progress regularly
+          const progress = (tracker.txs.length / 250 * 100).toFixed(0);
+          console.log(`[EarlyScore] � ${mint.slice(0, 8)}... Progress: ${tracker.txs.length}/250 txs (${progress}%) | Fetched: ${poolTxs.length} | New: ${newTxs} | Dups skipped: ${dupTxs}`);
+          
+          // Log running insider count
+          const runningInsiderCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
+          const runningInsiderPct = tracker.txs.length > 0 ? (runningInsiderCount / tracker.txs.length * 100).toFixed(1) : "0.0";
+          console.log(`[EarlyScore] 📈 Running insider %: ${runningInsiderPct}% (${runningInsiderCount}/${tracker.txs.length} txs)`);
         }
 
         // Check if we have 250 txs - make buy decision
         if (tracker.txs.length >= 250 && !tracker.evaluated) {
+          // Count insider txs (both buy AND sell)
           const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
           const insiderPercent = (insiderTxCount / tracker.txs.length) * 100;
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} insiderTxs=${insiderTxCount} insiderPercent=${insiderPercent.toFixed(1)}%`);
+          // Count insider buys vs sells
+          const insiderBuys = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "buy").length;
+          const insiderSells = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "sell").length;
+          
+          console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... REACHED 250 txs!`);
+          console.log(`[EarlyScore] 📊 FINAL STATS: totalTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | insiderPercent=${insiderPercent.toFixed(1)}%`);
           
           if (insiderPercent >= 90) {
-            // >90% insider txs - BUY
-            console.log(`[Bot] 🟢 INSIDER BUY: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% insider txs)`);
+            // >90% insider txs (buy or sell) - BUY
+            console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% insider txs >= 90% threshold)`);
             this.pendingPositions.delete(mint);
             this.attemptedBuys.add(mint);
             await this.copyBuyFromPending(pending, 1);
