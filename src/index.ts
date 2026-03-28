@@ -1636,7 +1636,7 @@ export class MeteoraDammV2CopyBot {
     const poolRpcUrl = this.config.poolRpcUrl ?? this.config.rpcUrl;
     const now = Date.now();
 
-    // ===== PHASE 1: EARLY SCORE ENGINE FOR PENDING POSITIONS =====
+    // ===== PHASE 1: SIMPLE BUY FLOW - Fetch 250 txs, check insider % =====
     for (const [mint, pending] of this.pendingPositions) {
       try {
         // Get real pool state from CpAmm SDK
@@ -1649,299 +1649,70 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        const prev = pending.prevPoolSnapshot;
-        const dToken = snapshot.tokenReserve - prev.tokenReserve;
-        const dQuote = snapshot.quoteReserve - prev.quoteReserve;
-
-        const priceMovePct = (snapshot.price - prev.price) / prev.price;
-        const quoteImpactPct = Math.abs(dQuote) / prev.quoteReserve;
-
-        const buyPressure = dQuote > 0 && dToken < 0;
-        const sellPressure = dQuote < 0 && dToken > 0;
-
-        // Direction tracking
-        const direction: "BUY" | "SELL" | "NONE" = buyPressure ? "BUY" : sellPressure ? "SELL" : "NONE";
-        pending.lastDirection = direction;
-
-        // ===== EARLY SCORE ENGINE: Get or create tracker =====
+        // ===== FETCH 250 TRANSACTIONS AND CHECK INSIDER % =====
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
-          
-          // Learn wallets from token mint (first 10 txs)
-          if (this.config.tokenAccountSlLeader) {
-            this.learnWalletsFromMint(mint, this.config.tokenAccountSlLeader).catch(err => {
-              console.error(`[Wallet] Error learning wallets: ${err.message}`);
-            });
-          }
         }
 
-        // ===== FETCH REAL TRANSACTIONS FROM POOL =====
-        // Get actual txs with wallet addresses, not just pool snapshots
-        if (!tracker.evaluated && tracker.txs.length < 200) {
+        // Fetch until we have 250 txs
+        if (!tracker.evaluated && tracker.txs.length < 250) {
           const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
           
-          // Track raw fetch and deduplication
-          tracker.rawFetchedCount += poolTxs.length;
           let newTxs = 0;
-          let dupTxs = 0;
-          
           for (const poolTx of poolTxs) {
-            // DEDUPLICATE by signature
-            if (tracker.seenSignatures.has(poolTx.signature)) {
-              dupTxs++;
-              tracker.duplicateCount++;
-              continue;
-            }
+            if (tracker.seenSignatures.has(poolTx.signature)) continue;
             tracker.seenSignatures.add(poolTx.signature);
             newTxs++;
             
             const earlyTx: EarlyTx = {
               signature: poolTx.signature,
               ts: poolTx.timestamp * 1000,
-              from: poolTx.wallet, // Real wallet address
+              from: poolTx.wallet,
               side: poolTx.side,
               amount: poolTx.amount,
             };
             this.updateEarlyMetrics(tracker, earlyTx);
             
-            // Log ALL wallets found
-            if (poolTx.wallet) {
-              const isLeader = this.leaderWalletSet.has(poolTx.wallet);
-              const isFollower = this.followerWalletSet.has(poolTx.wallet);
-              const isInsider = this.insiderWalletSet.has(poolTx.wallet);
-              
-              if (isLeader) {
-                console.log(`[EarlyScore] 🟨 LEADER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
-              } else if (isFollower) {
-                console.log(`[EarlyScore] 🟦 FOLLOWER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
-              } else if (isInsider) {
-                console.log(`[EarlyScore] 🟪 INSIDER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
-              } else {
-                // Log first 10 unknown wallets to see what we're getting
-                if (tracker.uniqueWallets.size <= 10) {
-                  console.log(`[EarlyScore] ⚪ UNKNOWN wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
-                }
-              }
-            } else {
-              console.log(`[EarlyScore] ⚠️ NO WALLET for tx ${poolTx.signature.slice(0, 8)}... (side=${poolTx.side})`);
+            // Log insider wallets
+            if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
+              console.log(`[EarlyScore] 🟪 INSIDER wallet: ${poolTx.wallet} (tx #${tracker.txs.length}, side=${poolTx.side})`);
             }
           }
           
-          // Log fetch summary with dedup info
-          if (poolTxs.length > 0) {
-            console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs: ${newTxs} new, ${dupTxs} dup skipped (total tracked: ${tracker.txs.length}, raw: ${tracker.rawFetchedCount}, dups: ${tracker.duplicateCount})`);
-          } else {
-            console.log(`[EarlyScore] 📋 Fetched 0 txs for ${mint.slice(0, 8)}... (total tracked: ${tracker.txs.length})`);
-          }
-          
-          // ===== STATE MACHINE TRANSITIONS =====
-          // Track known hits delta for ignition detection
-          tracker.knownHitsDelta = tracker.knownWalletHits - tracker.prevKnownHits;
-          tracker.newTxsLastBatch = newTxs;
-          tracker.prevKnownHits = tracker.knownWalletHits;
-          
-          // Detect buy compression (consecutive buys in recent txs)
-          const recentTxs = tracker.txs.slice(-10);
-          const recentBuys = recentTxs.filter(tx => tx.side === "buy").length;
-          tracker.buyCompression = recentBuys >= 6; // 60%+ buys in last 10 txs
-          
-          // State transitions
-          const prevState = tracker.state;
-          
-          // DORMANT → LATE_IGNITION: Dormant token suddenly woke up
-          if (tracker.state === "DORMANT") {
-            const insiderAppeared = tracker.knownHitsDelta > 0;
-            const txBurst = tracker.newTxsLastBatch >= 3;
-            const highBuyRatio = tracker.buyCount + tracker.sellCount > 0 
-              && tracker.buyCount / (tracker.buyCount + tracker.sellCount) >= 0.9;
-            
-            if (insiderAppeared && txBurst && highBuyRatio) {
-              tracker.state = "LATE_IGNITION";
-              tracker.ignitionDetectedAt = Date.now();
-              console.log(`[EarlyScore] 🔥 LATE IGNITION: ${mint.slice(0, 8)}... (knownHits +${tracker.knownHitsDelta}, newTxs=${tracker.newTxsLastBatch})`);
-            }
-          }
-          
-          // STAGE1_STRONG → STAGE2_CONFIRMED: Strong token confirmed momentum
-          if (tracker.state === "STAGE1_STRONG" || tracker.state === "LATE_IGNITION") {
-            const hasBuys = tracker.buyCompression;
-            const noEarlySells = tracker.sellCount < 3; // Few sells overall
-            const goodScore = tracker.score >= 60;
-            
-            if (hasBuys && noEarlySells && goodScore) {
-              tracker.state = "STAGE2_CONFIRMED";
-              console.log(`[EarlyScore] ✅ STAGE2_CONFIRMED: ${mint.slice(0, 8)}... (from ${prevState})`);
-            }
-          }
-          
-          // STAGE1_STALLED → REJECTED: Stalled token with early sell pressure
-          if (tracker.state === "STAGE1_STALLED") {
-            const hasSellPressure = tracker.sellCount >= 3;
-            const lowMomentum = tracker.score < 30;
-            
-            if (hasSellPressure && lowMomentum) {
-              tracker.state = "REJECTED";
-              console.log(`[EarlyScore] ❌ REJECTED: ${mint.slice(0, 8)}... (stalled + sell pressure)`);
-              tracker.evaluated = true;
-            }
-          }
+          console.log(`[EarlyScore] 📋 Fetched ${poolTxs.length} txs: ${newTxs} new (total: ${tracker.txs.length})`);
         }
 
-        // ===== EARLY SCORE ENGINE: Evaluate at staged points =====
-        if (this.shouldEvaluateEarly(tracker, now) && !tracker.evaluated) {
-          const score = this.scoreToken(tracker, now);
-          tracker.score = score;
-          tracker.decision = this.classifyEarlyToken(score, tracker);
+        // Check if we have 250 txs - make buy decision
+        if (tracker.txs.length >= 250 && !tracker.evaluated) {
+          const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
+          const insiderPercent = (insiderTxCount / tracker.txs.length) * 100;
           
-          const elapsedSec = Math.round((now - tracker.startedAt) / 1000);
-          const txPerSec = (tracker.txs.length / Math.max(elapsedSec, 1)).toFixed(1);
-          const uniqueRatio = (tracker.uniqueWallets.size / Math.max(tracker.txs.length, 1)).toFixed(2);
-          const buyRatio = tracker.buyCount + tracker.sellCount > 0 
-            ? (tracker.buyCount / (tracker.buyCount + tracker.sellCount)).toFixed(2) 
-            : "0.00";
+          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} insiderTxs=${insiderTxCount} insiderPercent=${insiderPercent.toFixed(1)}%`);
           
-          console.log(`[EarlyScore] ${mint.slice(0, 8)}... txs=${tracker.txs.length} (raw=${tracker.rawFetchedCount}, dups=${tracker.duplicateCount}) tps=${txPerSec} uniqueRatio=${uniqueRatio} buyRatio=${buyRatio} leaderHits=${tracker.leaderWalletHits} followerHits=${tracker.followerWalletHits} knownHits=${tracker.knownWalletHits} score=${score} state=${tracker.state} decision=${tracker.decision}`);
-
-          // ===== INITIAL STATE CLASSIFICATION =====
-          // Classify state based on early score (only if still DORMANT)
-          if (tracker.state === "DORMANT" && tracker.txs.length >= 20) {
-            const strongThreshold = 60;
-            const hasBuyCompression = tracker.buyCompression;
-            const hasActivity = tracker.txs.length >= 30;
-            
-            if (score >= strongThreshold && hasBuyCompression) {
-              tracker.state = "STAGE1_STRONG";
-              console.log(`[EarlyScore] 💪 STAGE1_STRONG: ${mint.slice(0, 8)}... (score=${score}, buyCompression=${hasBuyCompression})`);
-            } else if (hasActivity && !hasBuyCompression && score < 50) {
-              tracker.state = "STAGE1_STALLED";
-              console.log(`[EarlyScore] 🐌 STAGE1_STALLED: ${mint.slice(0, 8)}... (activity but no conviction, score=${score})`);
-            }
-            // Otherwise stays DORMANT - waiting for ignition
-          }
-
-          // ===== BUY TRIGGERS (State Machine Based) =====
-          // Only buy from STAGE1_STRONG, LATE_IGNITION, or STAGE2_CONFIRMED
-          
-          if (tracker.state === "STAGE1_STRONG" && tracker.txs.length >= 30) {
-            // STRONG: Trigger buy immediately
-            console.log(`[Bot] 🟢 STAGE1_STRONG BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
+          if (insiderPercent >= 90) {
+            // >90% insider txs - BUY
+            console.log(`[Bot] 🟢 INSIDER BUY: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% insider txs)`);
             this.pendingPositions.delete(mint);
             this.attemptedBuys.add(mint);
             await this.copyBuyFromPending(pending, 1);
             continue;
-          }
-          
-          if (tracker.state === "LATE_IGNITION" && tracker.txs.length >= 20) {
-            // LATE IGNITION: Buy after ignition confirmed
-            // But reject if no known wallet support OR decision is bad
-            const hasKnownSupport = tracker.knownWalletHits > 0 || tracker.leaderWalletHits > 0 || tracker.followerWalletHits > 0;
-            
-            if (!hasKnownSupport) {
-              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (LATE_IGNITION but no known wallet support)`);
-              tracker.state = "REJECTED";
-              tracker.evaluated = true;
-              continue;
-            }
-            
-            if (tracker.decision === "bad") {
-              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (LATE_IGNITION but decision=bad)`);
-              tracker.state = "REJECTED";
-              tracker.evaluated = true;
-              continue;
-            }
-            
-            const ignitionAge = Date.now() - (tracker.ignitionDetectedAt ?? Date.now());
-            if (ignitionAge < 30000) { // Within 30s of ignition
-              console.log(`[Bot] 🔥 LATE_IGNITION BUY: ${mint.slice(0, 8)}... (score=${score}, knownHits=${tracker.knownWalletHits})`);
-              this.pendingPositions.delete(mint);
-              this.attemptedBuys.add(mint);
-              await this.copyBuyFromPending(pending, 1);
-              continue;
-            }
-          }
-          
-          if (tracker.state === "STAGE2_CONFIRMED") {
-            // STAGE2 CONFIRMED: Buy with higher confidence
-            console.log(`[Bot] ✅ STAGE2_CONFIRMED BUY: ${mint.slice(0, 8)}... (score=${score})`);
-            this.pendingPositions.delete(mint);
-            this.attemptedBuys.add(mint);
-            await this.copyBuyFromPending(pending, 2);
+          } else {
+            // Not enough insider activity - reject
+            console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (only ${insiderPercent.toFixed(1)}% insider txs, need 90%)`);
+            tracker.evaluated = true;
             continue;
           }
-
-          // ===== LEGACY STAGE SYSTEM (Fallback) =====
-          // ===== STAGE 1: Early Structure Decision =====
-          if (tracker.stage === 1) {
-            if (tracker.decision === "good" && tracker.txs.length >= 30) {
-              // GOOD: Trigger buy immediately (legacy path)
-              console.log(`[Bot] 🟢 STAGE 1 BUY: ${mint.slice(0, 8)}... (score=${score}, txs=${tracker.txs.length})`);
-              this.pendingPositions.delete(mint);
-              this.attemptedBuys.add(mint);
-              await this.copyBuyFromPending(pending, 1);
-              continue;
-            } else if (tracker.decision === "watchlist") {
-              // WATCHLIST: Move to stage 2 for momentum confirmation
-              tracker.stage = 2;
-              tracker.stage1Score = score;
-              tracker.stage1Decision = "watchlist";
-              console.log(`[Bot] 🟡 STAGE 1 → STAGE 2: ${mint.slice(0, 8)}... (insider presence, watching for momentum)`);
-            } else if (tracker.decision === "bad") {
-              // BAD: Stop tracking
-              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (score=${score})`);
-              tracker.evaluated = true;
-            } else if (tracker.decision === "pending" && tracker.txs.length >= 80) {
-              // PENDING at 80 txs: Move to stage 2 for extended watch
-              tracker.stage = 2;
-              tracker.stage1Score = score;
-              tracker.stage1Decision = "pending";
-              console.log(`[Bot] 🟠 STAGE 1 → STAGE 2: ${mint.slice(0, 8)}... (pending, extended watch)`);
-            }
-          }
-          
-          // ===== STAGE 2: Momentum Confirmation =====
-          if (tracker.stage === 2) {
-            // Check for confirmation signals
-            this.checkStage2Confirmation(tracker, snapshot, buyPressure);
-            
-            // Require 2+ confirmations to promote to good
-            if (tracker.stage2Confirmations >= 2) {
-              console.log(`[Bot] 🟢 STAGE 2 BUY: ${mint.slice(0, 8)}... (confirmations=${tracker.stage2Confirmations})`);
-              tracker.decision = "good";
-              this.pendingPositions.delete(mint);
-              this.attemptedBuys.add(mint);
-              await this.copyBuyFromPending(pending, 2);
-              continue;
-            }
-            
-            // Timeout for stage 2
-            if (tracker.txs.length >= 200 || elapsedSec >= 120) {
-              console.log(`[Bot] ⏸️ STAGE 2 TIMEOUT: ${mint.slice(0, 8)}... (confirmations=${tracker.stage2Confirmations})`);
-              tracker.evaluated = true;
-            }
-          }
-        }
-
-        // Extreme events - immediate reject
-        const extremeDump = priceMovePct < -0.5 || quoteImpactPct > 0.3;
-        const possibleLiquidityPull =
-          (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
-          (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
-
-        if (extremeDump || possibleLiquidityPull) {
-          console.log(`[Bot] Pool ${mint.slice(0, 8)}... → REJECT (dump=${(priceMovePct * 100).toFixed(1)}%)`);
-          if (tracker) tracker.evaluated = true;
         }
 
         pending.prevPoolSnapshot = snapshot;
-        pending.lastPriceMove = priceMovePct;
       } catch (err: any) {
         // Silently skip on error
       }
     }
 
-    // ===== PHASE 2: Monitor OPEN positions (state machine decides exit) =====
+    // ===== PHASE 2: Monitor OPEN positions (TP/SL exits only) =====
     for (const [mint, position] of this.openPositions) {
       // Skip if no pool address for this position
       if (!position.poolAddress) continue;
@@ -1958,134 +1729,6 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        const prev = position.prevPoolSnapshot;
-        const dToken = snapshot.tokenReserve - prev.tokenReserve;
-        const dQuote = snapshot.quoteReserve - prev.quoteReserve;
-
-        const priceMovePct = (snapshot.price - prev.price) / prev.price;
-        const quoteImpactPct = Math.abs(dQuote) / prev.quoteReserve;
-
-        const buyPressure = dQuote > 0 && dToken < 0;
-        const sellPressure = dQuote < 0 && dToken > 0;
-
-        // Direction tracking
-        const direction: "BUY" | "SELL" | "NONE" = buyPressure ? "BUY" : sellPressure ? "SELL" : "NONE";
-
-        if (direction !== position.lastDirection && position.lastDirection !== "NONE") {
-          position.flipCount++;
-        }
-        position.lastDirection = direction;
-
-        // ===== ENHANCED MOMENTUM TRACKING FOR EXITS =====
-        // Consecutive buys/sells
-        if (buyPressure) {
-          position.consecutiveBuys++;
-          position.consecutiveSells = 0;
-        } else if (sellPressure) {
-          position.consecutiveSells++;
-          position.consecutiveBuys = 0;
-        }
-
-        // Calculate momentum score
-        const momentumScore = position.consecutiveBuys * 2 - position.consecutiveSells * 1.5 - position.flipCount * 0.3;
-        
-        // Track intervals since entry for breakout protection
-        position.intervalsSinceEntry++;
-        
-        // Track peak momentum for strong trend override
-        if (momentumScore > position.peakMomentum) {
-          position.peakMomentum = momentumScore;
-          position.intervalsSincePeakMomentum = 0; // Reset when new peak
-        } else {
-          position.intervalsSincePeakMomentum++; // Increment when not beating peak
-        }
-        
-        // Track momentum history
-        position.momentumHistory.push(momentumScore);
-        if (position.momentumHistory.length > 5) position.momentumHistory.shift();
-        
-        // Detect momentum direction
-        const prevMomentum = position.momentumHistory.length > 1 
-          ? position.momentumHistory[position.momentumHistory.length - 2] 
-          : 0;
-        position.momentumIncreasing = momentumScore > prevMomentum;
-        position.momentumScore = momentumScore;
-
-        // Dip absorption for exits
-        if (sellPressure && position.consecutiveBuys === 0) {
-          position.lastDipRecovery = -Math.abs(priceMovePct);
-        } else if (buyPressure && position.lastDipRecovery < 0) {
-          const recoveryStrength = priceMovePct - position.lastDipRecovery;
-          if (recoveryStrength > 0.01) {
-            position.dipsAbsorbed++;
-            position.lastDipRecovery = priceMovePct;
-          }
-        }
-
-        // ===== INSIDER MOVEMENT TRACKING =====
-        // Track insider buy rate per interval for momentum decay detection
-        const prevInsiderBuysThisInterval = position.insiderBuysThisInterval;
-        
-        // Fetch recent pool transactions to detect insider activity
-        try {
-          const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
-          for (const tx of poolTxs.slice(0, 10)) { // Check last 10 txs
-            if (tx.wallet && this.insiderWalletSet.has(tx.wallet)) {
-              const now = Date.now();
-              // Check if this is a new insider activity (within last 5 seconds)
-              if (!position.lastInsiderActivity || 
-                  position.lastInsiderActivity.timestamp < now - 5000 ||
-                  position.lastInsiderActivity.wallet !== tx.wallet) {
-                
-                if (tx.side === "buy") {
-                  position.insiderBuysSinceEntry++;
-                  position.insiderBuysThisInterval++; // Track per interval
-                  console.log(`[Pool] 🟪 INSIDER BUY: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total: ${position.insiderBuysSinceEntry}, thisInterval: ${position.insiderBuysThisInterval})`);
-                  position.lastInsiderActivity = {
-                    wallet: tx.wallet,
-                    side: "buy",
-                    timestamp: now
-                  };
-                } else if (tx.side === "sell") {
-                  position.insiderSellsSinceEntry++;
-                  console.log(`[Pool] 🟪 INSIDER SELL: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total insider sells: ${position.insiderSellsSinceEntry})`);
-                  position.lastInsiderActivity = {
-                    wallet: tx.wallet,
-                    side: "sell",
-                    timestamp: now
-                  };
-                }
-              }
-            }
-          }
-        } catch (err) {
-          // Silently continue if fetch fails
-        }
-        
-        // Track peak insider buy rate
-        if (position.insiderBuysThisInterval > position.peakInsiderBuyRate) {
-          position.peakInsiderBuyRate = position.insiderBuysThisInterval;
-        }
-        
-        // INSIDER MOMENTUM DECAY EXIT: If insider buy rate dropped from 6+ to <=3
-        // Compare current interval against the peak we've seen
-        const insiderMomentumDecay = 
-          position.peakInsiderBuyRate >= 6 && 
-          position.insiderBuysThisInterval <= 3 &&
-          position.insiderBuysThisInterval < position.peakInsiderBuyRate - 2; // Dropped significantly
-        
-        if (insiderMomentumDecay && position.highestProfit > 0) {
-          console.log(`[Bot] 🟪 INSIDER MOMENTUM DECAY: ${mint.slice(0, 8)}... (peak=${position.peakInsiderBuyRate} → thisInterval=${position.insiderBuysThisInterval}, profit=${position.highestProfit.toFixed(1)}%)`);
-          await this.copySell(mint, "INSIDER_MOMENTUM_DECAY", 100);
-          continue;
-        }
-        
-        // Track previous interval for next comparison (before reset)
-        position.insiderBuysPrevInterval = position.insiderBuysThisInterval;
-        
-        // Reset insider buys this interval for next check
-        position.insiderBuysThisInterval = 0;
-
         // Calculate profit
         if (position.entryPrice && position.entryPrice > 0) {
           const profitPct = ((snapshot.price - position.entryPrice) / position.entryPrice) * 100;
@@ -2094,142 +1737,57 @@ export class MeteoraDammV2CopyBot {
             position.highestProfit = profitPct;
           }
 
-          // ===== PROFIT EXIT LOGIC =====
-          // Exit when profit > target AND trend is breaking
-          const trendBreaking = 
-            position.consecutiveBuys === 0 && 
-            position.consecutiveSells >= 2 &&
-            !position.momentumIncreasing;
+          // Log pool status
+          console.log(`[Pool] ${mint.slice(0, 8)}... profit=${profitPct.toFixed(1)}% price=${snapshot.price.toFixed(9)} highestProfit=${position.highestProfit.toFixed(1)}%`);
+
+          // ===== TP/SL EXIT LOGIC ONLY =====
+          // TP1: Sell TP1_SELL_PERCENT at TP1_TRIGGER multiplier
+          // TP2: Sell remaining at TP2_TRIGGER multiplier  
+          // SL: Sell all at SL_TRIGGER multiplier
+          // SmartSL: Trail stop loss from SMART_SL_CEILING to SMART_SL_FLOOR
           
-          if (profitPct >= profitExitPercent && trendBreaking) {
-            console.log(`[Bot] PROFIT EXIT: ${mint.slice(0, 8)}... (${profitPct.toFixed(1)}% profit, trend breaking)`);
-            await this.copySell(mint, "PROFIT_EXIT", 100);
+          const tp1Trigger = this.config.tp1Trigger ?? 1.5;
+          const tp1SellPercent = this.config.tp1SellPercent ?? 50;
+          const tp2Trigger = this.config.tp2Trigger ?? 3.0;
+          const slTrigger = this.config.slTrigger ?? 0.5;
+          const smartSlCeiling = this.config.smartSlCeiling ?? 1.8;
+          const smartSlFloor = this.config.smartSlFloor ?? 1.4;
+          
+          const currentMultiplier = snapshot.price / position.entryPrice;
+          
+          // Check TP1
+          if (!position.tp1Hit && currentMultiplier >= tp1Trigger) {
+            position.tp1Hit = true;
+            console.log(`[Bot] 🎯 TP1 HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, selling ${tp1SellPercent}%)`);
+            await this.copySell(mint, "TP1", tp1SellPercent);
+          }
+          
+          // Check TP2 (only after TP1)
+          if (position.tp1Hit && currentMultiplier >= tp2Trigger) {
+            console.log(`[Bot] 🎯 TP2 HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, selling remaining)`);
+            await this.copySell(mint, "TP2", 100);
             continue;
           }
-        }
-
-        // Extreme events
-        const extremeDump = priceMovePct < -0.5 || quoteImpactPct > 0.3;
-        const possibleLiquidityPull =
-          (prev.tokenReserve - snapshot.tokenReserve) / prev.tokenReserve > 0.2 &&
-          (prev.quoteReserve - snapshot.quoteReserve) / prev.quoteReserve > 0.2;
-        
-        // ===== POST-ENTRY VALIDATION (Stage 1 vs Stage 2) =====
-        // Stage 1 buys need validation, Stage 2 buys are pre-validated
-        const timeSinceEntry = Date.now() - position.entryTime;
-        const earlyWindow = timeSinceEntry < 10000; // First 10 seconds
-        
-        // EARLY KILL SWITCH: Exit immediately if bad structure within 10s of entry
-        // This catches fake pumps that collapse right after entry
-        if (earlyWindow && !position.earlyKillTriggered && position.entryStage === 1) {
-          if (position.consecutiveSells >= 2 && momentumScore <= -4) {
-            console.log(`[Bot] ⚡ EARLY KILL SWITCH: ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} time=${(timeSinceEntry/1000).toFixed(1)}s)`);
-            position.earlyKillTriggered = true;
-            await this.copySell(mint, "EARLY_KILL_SWITCH", 100);
+          
+          // Check Stop Loss
+          if (currentMultiplier <= slTrigger) {
+            console.log(`[Bot] 🛑 SL HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry)`);
+            await this.copySell(mint, "STOP_LOSS", 100);
             continue;
           }
-        }
-        
-        // POST-ENTRY VALIDATION: Check if momentum is expanding after entry
-        // Stage 1 buys need 5 intervals to prove themselves
-        if (!position.postEntryValidated && position.intervalsSinceEntry >= 5) {
-          if (position.entryStage === 1) {
-            // Check for momentum expansion (slope positive)
-            const momSlope = position.momentumHistory.length >= 3
-              ? position.momentumHistory[2] - position.momentumHistory[0]
-              : 0;
+          
+          // Smart Trailing Stop Loss
+          if (position.highestProfit > smartSlCeiling * 100 - 100) {
+            // We've reached ceiling, start trailing
+            const trailingSl = position.highestProfit / 100 + 1 - (smartSlCeiling - smartSlFloor);
+            const floorPrice = position.entryPrice * smartSlFloor;
             
-            const hasMomentumExpansion = momSlope > 0 || position.peakMomentum >= 4;
-            const hasConsecBuys = position.consecutiveBuys >= 3;
-            const noEarlySells = position.consecutiveSells < 2;
-            
-            if (hasMomentumExpansion && (hasConsecBuys || noEarlySells)) {
-              position.postEntryValidated = true;
-              console.log(`[Bot] ✅ POST-ENTRY VALIDATED: ${mint.slice(0, 8)}... (stage=1 slope=${momSlope.toFixed(1)} peakMom=${position.peakMomentum.toFixed(1)})`);
-            } else if (momentumScore <= -4 || position.consecutiveSells >= 2) {
-              // Failed validation - exit
-              console.log(`[Bot] ❌ POST-ENTRY FAILED: ${mint.slice(0, 8)}... (stage=1 no momentum expansion, slope=${momSlope.toFixed(1)})`);
-              await this.copySell(mint, "VALIDATION_FAILED", 100);
+            if (snapshot.price <= position.entryPrice * trailingSl && snapshot.price > floorPrice) {
+              console.log(`[Bot] 🔒 SMART SL HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, trailing from ${position.highestProfit.toFixed(1)}%)`);
+              await this.copySell(mint, "SMART_SL", 100);
               continue;
-            } else {
-              // Weak but not terrible - mark validated and continue holding
-              position.postEntryValidated = true;
-              console.log(`[Bot] ⚠️ POST-ENTRY WEAK: ${mint.slice(0, 8)}... (stage=1 validated with low confidence, slope=${momSlope.toFixed(1)})`);
             }
-          } else {
-            // Stage 2 buys are pre-validated by momentum confirmation
-            position.postEntryValidated = true;
-            console.log(`[Bot] ✅ STAGE 2 PRE-VALIDATED: ${mint.slice(0, 8)}...`);
           }
-        }
-
-        // ===== BREAKOUT PROTECTION =====
-        // First pullback after breakout is NOT an exit signal
-        // Ignore single sells in first 5 intervals after entry
-        const earlyPullback = 
-          position.intervalsSinceEntry < 5 &&
-          position.consecutiveSells === 1 &&
-          momentumScore > -4;
-
-        // Strong trend override: conditional, not just based on old peakMom
-        // Only allow override if:
-        // 1. NOT a severe dump (move > -8% or impact > 5%)
-        // 2. Peak momentum is fresh (within 3 intervals)
-        // 3. No sell structure broken (consecSells < 2)
-        // 4. Current momentum not too negative (>= -3)
-        // 5. Has fresh buy support (consecBuys >= 2 recently)
-        const severeDump = priceMovePct <= -0.08 || quoteImpactPct >= 0.05;
-        const staleTrend = position.intervalsSincePeakMomentum > 3;
-        const weakCurrentMomentum = momentumScore <= -3;
-        const sellStructureBroken = position.consecutiveSells >= 2 || position.trendBroken;
-        const hasFreshBuySupport = position.consecutiveBuys >= 2 && !weakCurrentMomentum;
-        
-        const allowStrongTrendOverride = 
-          !severeDump &&
-          !staleTrend &&
-          !sellStructureBroken &&
-          !weakCurrentMomentum &&
-          hasFreshBuySupport &&
-          position.peakMomentum > 5;
-
-        const strongTrendOverride = allowStrongTrendOverride && position.consecutiveSells === 1;
-
-        // ===== TREND BREAK DETECTION =====
-        // Only trend broken when confirmed weakness (not just single sell)
-        position.trendBroken = 
-          (position.consecutiveSells >= 2 && momentumScore <= -4) ||
-          momentumScore <= -6;
-
-        // ===== DANGER EXIT CONDITIONS =====
-        // Require BOTH consecutive sells AND negative momentum
-        const dangerExit =
-          (position.consecutiveSells >= 2 && momentumScore <= -4) ||
-          momentumScore <= -6;
-
-        // Check if last bounce was weak (buy followed by immediate sell)
-        const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && momentumScore < 0;
-
-        // ===== EXIT LOGIC (NO STATE MACHINE) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit} insiderBuys=${position.insiderBuysSinceEntry} insiderSells=${position.insiderSellsSinceEntry}`);
-        
-        // Skip exits during early pullback (first 5 intervals)
-        if (earlyPullback) {
-          console.log(`[Bot] Early pullback for ${mint.slice(0, 8)}... ignoring (interval=${position.intervalsSinceEntry})`);
-        } else if (strongTrendOverride) {
-          // Skip exits if strong trend override (had momentum > 5)
-          console.log(`[Bot] Strong trend override for ${mint.slice(0, 8)}... ignoring sell (peakMom=${position.peakMomentum.toFixed(1)})`);
-        } else if (extremeDump || possibleLiquidityPull) {
-          // HARD EXIT: Only for extreme events (rug already happened)
-          console.log(`[Bot] HARD EXIT: Dump detected for ${mint.slice(0, 8)}...`);
-          await this.copySell(mint, "HARD_EXIT", 100);
-        } else if (dangerExit) {
-          // STRUCTURE EXIT: Exit during warning phase (before collapse)
-          console.log(`[Bot] STRUCTURE EXIT: Weak structure for ${mint.slice(0, 8)}... (consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} weakBounce=${weakBounce})`);
-          await this.copySell(mint, "STRUCTURE_EXIT", 100);
-        } else if (position.trendBroken) {
-          // SOFT EXIT: Trend definitively broken (fallback)
-          console.log(`[Bot] SOFT EXIT: Trend broken for ${mint.slice(0, 8)}... (consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)})`);
-          await this.copySell(mint, "SOFT_EXIT", 100);
         }
 
         position.prevPoolSnapshot = snapshot;
