@@ -1649,57 +1649,76 @@ export class MeteoraDammV2CopyBot {
           continue;
         }
 
-        // ===== FETCH 250 TRANSACTIONS AND CHECK INSIDER % =====
+        // ===== FETCH FULL 250 POOL TRANSACTIONS IMMEDIATELY =====
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
           this.earlyMetricsMap.set(mint, tracker);
-          console.log(`[EarlyScore] 🔄 Starting tx collection for ${mint.slice(0, 8)}... (need 250 txs)`);
+          console.log(`[EarlyScore] 🔄 Fetching first 250 pool txs for ${mint.slice(0, 8)}...`);
         }
 
-        // Fetch until we have 250 txs
+        // Fetch full 250 txs from pool address using pagination (if not done yet)
         if (!tracker.evaluated && tracker.txs.length < 250) {
-          const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
+          // Keep fetching batches until we have 250 txs
+          let beforeSignature: string | undefined = undefined;
+          let totalFetched = 0;
+          let totalDups = 0;
           
-          let newTxs = 0;
-          let dupTxs = 0;
-          for (const poolTx of poolTxs) {
-            // Deduplicate by signature
-            if (tracker.seenSignatures.has(poolTx.signature)) {
-              dupTxs++;
-              continue;
-            }
-            tracker.seenSignatures.add(poolTx.signature);
-            newTxs++;
+          while (tracker.txs.length < 250) {
+            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, beforeSignature);
+            if (poolTxs.length === 0) break; // No more txs available
             
-            const earlyTx: EarlyTx = {
-              signature: poolTx.signature,
-              ts: poolTx.timestamp * 1000,
-              from: poolTx.wallet,
-              side: poolTx.side,
-              amount: poolTx.amount,
-            };
-            this.updateEarlyMetrics(tracker, earlyTx);
+            let newTxs = 0;
+            let dupTxs = 0;
             
-            // Log insider wallets (buy or sell)
-            if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
-              console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()}: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+            for (const poolTx of poolTxs) {
+              // Deduplicate by signature
+              if (tracker.seenSignatures.has(poolTx.signature)) {
+                dupTxs++;
+                continue;
+              }
+              tracker.seenSignatures.add(poolTx.signature);
+              newTxs++;
+              
+              const earlyTx: EarlyTx = {
+                signature: poolTx.signature,
+                ts: poolTx.timestamp * 1000,
+                from: poolTx.wallet,
+                side: poolTx.side,
+                amount: poolTx.amount,
+              };
+              this.updateEarlyMetrics(tracker, earlyTx);
+              
+              // Log insider wallets (buy or sell)
+              if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
+                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()}: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+              }
+              
+              // Stop at 250
+              if (tracker.txs.length >= 250) break;
             }
+            
+            totalFetched += poolTxs.length;
+            totalDups += dupTxs;
+            
+            // Set cursor for next batch (oldest tx signature)
+            if (poolTxs.length > 0) {
+              beforeSignature = poolTxs[poolTxs.length - 1].signature;
+            }
+            
+            // Log batch progress
+            console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250`);
+            
+            // Break if no new txs were added (reached end of history)
+            if (newTxs === 0) break;
           }
           
-          // Log progress regularly
-          const progress = (tracker.txs.length / 250 * 100).toFixed(0);
-          console.log(`[EarlyScore] � ${mint.slice(0, 8)}... Progress: ${tracker.txs.length}/250 txs (${progress}%) | Fetched: ${poolTxs.length} | New: ${newTxs} | Dups skipped: ${dupTxs}`);
-          
-          // Log running insider count
-          const runningInsiderCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
-          const runningInsiderPct = tracker.txs.length > 0 ? (runningInsiderCount / tracker.txs.length * 100).toFixed(1) : "0.0";
-          console.log(`[EarlyScore] 📈 Running insider %: ${runningInsiderPct}% (${runningInsiderCount}/${tracker.txs.length} txs)`);
+          console.log(`[EarlyScore] � Done fetching: ${tracker.txs.length} unique txs (total fetched: ${totalFetched}, dups skipped: ${totalDups})`);
         }
 
         // Check if we have 250 txs - make buy decision
         if (tracker.txs.length >= 250 && !tracker.evaluated) {
-          // Count insider txs (both buy AND sell)
+          // Count insider txs (both buy AND sell) from FULL pool activity
           const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
           const insiderPercent = (insiderTxCount / tracker.txs.length) * 100;
           
@@ -1707,22 +1726,27 @@ export class MeteoraDammV2CopyBot {
           const insiderBuys = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "buy").length;
           const insiderSells = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "sell").length;
           
-          console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... REACHED 250 txs!`);
-          console.log(`[EarlyScore] 📊 FINAL STATS: totalTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | insiderPercent=${insiderPercent.toFixed(1)}%`);
+          console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... HAVE ${tracker.txs.length} POOL TXS`);
+          console.log(`[EarlyScore] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | dominancePct=${insiderPercent.toFixed(1)}%`);
           
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
-            console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% insider txs >= 90% threshold)`);
+            console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% dominance >= 90% threshold)`);
             this.pendingPositions.delete(mint);
             this.attemptedBuys.add(mint);
             await this.copyBuyFromPending(pending, 1);
             continue;
           } else {
             // Not enough insider activity - reject
-            console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (only ${insiderPercent.toFixed(1)}% insider txs, need 90%)`);
+            console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (only ${insiderPercent.toFixed(1)}% dominance, need 90%)`);
             tracker.evaluated = true;
             continue;
           }
+        }
+        
+        // If we couldn't get 250 txs (pool too new), reject
+        if (tracker.txs.length < 250 && !tracker.evaluated) {
+          console.log(`[Bot] ⏳ ${mint.slice(0, 8)}... Only ${tracker.txs.length} txs in pool, waiting...`);
         }
 
         pending.prevPoolSnapshot = snapshot;
