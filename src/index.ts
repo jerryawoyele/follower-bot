@@ -1031,7 +1031,7 @@ export class MeteoraDammV2CopyBot {
           mentions: [this.leader],
         },
         {
-          commitment: "confirmed",
+          commitment: "processed",
         },
       ],
     };
