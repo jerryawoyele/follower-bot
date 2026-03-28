@@ -249,6 +249,10 @@ type FollowState = {
   entryTime: number; // Timestamp of entry (ms)
   postEntryValidated: boolean; // Has post-entry structure been validated?
   earlyKillTriggered: boolean; // Was early kill switch activated?
+  // Insider movement tracking during position
+  insiderBuysSinceEntry: number; // Insider buys after bot entry
+  insiderSellsSinceEntry: number; // Insider sells after bot entry
+  lastInsiderActivity?: { wallet: string; side: "buy" | "sell"; timestamp: number };
 };
 
 // Helius API types
@@ -2014,6 +2018,42 @@ export class MeteoraDammV2CopyBot {
           }
         }
 
+        // ===== INSIDER MOVEMENT TRACKING =====
+        // Fetch recent pool transactions to detect insider activity
+        try {
+          const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
+          for (const tx of poolTxs.slice(0, 10)) { // Check last 10 txs
+            if (tx.wallet && this.insiderWalletSet.has(tx.wallet)) {
+              const now = Date.now();
+              // Check if this is a new insider activity (within last 5 seconds)
+              if (!position.lastInsiderActivity || 
+                  position.lastInsiderActivity.timestamp < now - 5000 ||
+                  position.lastInsiderActivity.wallet !== tx.wallet) {
+                
+                if (tx.side === "buy") {
+                  position.insiderBuysSinceEntry++;
+                  console.log(`[Pool] 🟪 INSIDER BUY: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total insider buys: ${position.insiderBuysSinceEntry})`);
+                  position.lastInsiderActivity = {
+                    wallet: tx.wallet,
+                    side: "buy",
+                    timestamp: now
+                  };
+                } else if (tx.side === "sell") {
+                  position.insiderSellsSinceEntry++;
+                  console.log(`[Pool] 🟪 INSIDER SELL: ${tx.wallet.slice(0, 8)}... on ${mint.slice(0, 8)}... (total insider sells: ${position.insiderSellsSinceEntry})`);
+                  position.lastInsiderActivity = {
+                    wallet: tx.wallet,
+                    side: "sell",
+                    timestamp: now
+                  };
+                }
+              }
+            }
+          }
+        } catch (err) {
+          // Silently continue if fetch fails
+        }
+
         // Calculate profit
         if (position.entryPrice && position.entryPrice > 0) {
           const profitPct = ((snapshot.price - position.entryPrice) / position.entryPrice) * 100;
@@ -2139,7 +2179,7 @@ export class MeteoraDammV2CopyBot {
         const weakBounce = position.consecutiveBuys === 1 && position.lastDirection === "SELL" && momentumScore < 0;
 
         // ===== EXIT LOGIC (NO STATE MACHINE) =====
-        console.log(`[Pool] ${mint.slice(0, 8)}... profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit}`);
+        console.log(`[Pool] ${mint.slice(0, 8)}... profit=${position.highestProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} move=${(priceMovePct * 100).toFixed(2)}% impact=${(quoteImpactPct * 100).toFixed(2)}% buy=${buyPressure} sell=${sellPressure} consecBuys=${position.consecutiveBuys} consecSells=${position.consecutiveSells} momentum=${momentumScore.toFixed(1)} trendBroken=${position.trendBroken} dangerExit=${dangerExit} insiderBuys=${position.insiderBuysSinceEntry} insiderSells=${position.insiderSellsSinceEntry}`);
         
         // Skip exits during early pullback (first 5 intervals)
         if (earlyPullback) {
@@ -2281,6 +2321,10 @@ export class MeteoraDammV2CopyBot {
       entryTime: Date.now(),
       postEntryValidated: false,
       earlyKillTriggered: false,
+      // Insider movement tracking
+      insiderBuysSinceEntry: 0,
+      insiderSellsSinceEntry: 0,
+      lastInsiderActivity: undefined,
     });
 
     console.log(
@@ -2598,6 +2642,10 @@ export class MeteoraDammV2CopyBot {
       entryTime: Date.now(),
       postEntryValidated: false,
       earlyKillTriggered: false,
+      // Insider movement tracking
+      insiderBuysSinceEntry: 0,
+      insiderSellsSinceEntry: 0,
+      lastInsiderActivity: undefined,
     });
 
     console.log(
