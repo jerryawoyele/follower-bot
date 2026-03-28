@@ -2152,10 +2152,9 @@ export class MeteoraDammV2CopyBot {
               await this.copySell(mint, "VALIDATION_FAILED", 100);
               continue;
             } else {
-              // Weak validation - exit with low confidence rather than holding
-              console.log(`[Bot] ❌ POST-ENTRY WEAK EXIT: ${mint.slice(0, 8)}... (stage=1 weak structure, slope=${momSlope.toFixed(1)} peakMom=${position.peakMomentum.toFixed(1)})`);
-              await this.copySell(mint, "WEAK_VALIDATION", 100);
-              continue;
+              // Weak but not terrible - mark validated and continue holding
+              position.postEntryValidated = true;
+              console.log(`[Bot] ⚠️ POST-ENTRY WEAK: ${mint.slice(0, 8)}... (stage=1 validated with low confidence, slope=${momSlope.toFixed(1)})`);
             }
           } else {
             // Stage 2 buys are pre-validated by momentum confirmation
