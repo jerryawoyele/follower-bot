@@ -2067,24 +2067,21 @@ export class MeteoraDammV2CopyBot {
           position.peakInsiderBuyRate = position.insiderBuysThisInterval;
         }
         
-        // At end of interval tracking, shift to prev and reset
-        // This happens naturally each pool check (every ~2s)
-        if (position.insiderBuysThisInterval !== prevInsiderBuysThisInterval) {
-          // We had new insider buys this check, update prev for next comparison
-          position.insiderBuysPrevInterval = prevInsiderBuysThisInterval > 0 ? prevInsiderBuysThisInterval : position.insiderBuysThisInterval;
-        }
-        
         // INSIDER MOMENTUM DECAY EXIT: If insider buy rate dropped from 6+ to <=3
+        // Compare current interval against the peak we've seen
         const insiderMomentumDecay = 
           position.peakInsiderBuyRate >= 6 && 
           position.insiderBuysThisInterval <= 3 &&
-          position.insiderBuysPrevInterval >= 4; // Was strong, now weak
+          position.insiderBuysThisInterval < position.peakInsiderBuyRate - 2; // Dropped significantly
         
         if (insiderMomentumDecay && position.highestProfit > 0) {
           console.log(`[Bot] 🟪 INSIDER MOMENTUM DECAY: ${mint.slice(0, 8)}... (peak=${position.peakInsiderBuyRate} → thisInterval=${position.insiderBuysThisInterval}, profit=${position.highestProfit.toFixed(1)}%)`);
           await this.copySell(mint, "INSIDER_MOMENTUM_DECAY", 100);
           continue;
         }
+        
+        // Track previous interval for next comparison (before reset)
+        position.insiderBuysPrevInterval = position.insiderBuysThisInterval;
         
         // Reset insider buys this interval for next check
         position.insiderBuysThisInterval = 0;
