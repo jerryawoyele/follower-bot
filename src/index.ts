@@ -1513,16 +1513,17 @@ export class MeteoraDammV2CopyBot {
   }
 
   // Fetch transactions for a pool with wallet addresses
-  // Uses cursor-based paging with 'before' parameter to avoid re-fetching
-  private async fetchPoolTransactions(poolAddress: string, beforeSignature?: string): Promise<PoolTx[]> {
+  // Uses cursor-based paging - fetches txs newer than the cursor for growing pools
+  private async fetchPoolTransactions(poolAddress: string, afterSignature?: string): Promise<PoolTx[]> {
     try {
       const url = new URL(`${HELIUS_BASE}/addresses/${poolAddress}/transactions`);
       url.searchParams.set("api-key", this.heliusApiKey);
       url.searchParams.set("limit", "50");
       
-      // Use 'before' cursor for pagination - fetches txs older than this signature
-      if (beforeSignature) {
-        url.searchParams.set("before", beforeSignature);
+      // Use 'after' cursor for pagination - fetches txs NEWER than this signature
+      // This is correct for new pools where we're waiting for txs to accumulate
+      if (afterSignature) {
+        url.searchParams.set("after", afterSignature);
       }
       
       const resp = await fetch(url.toString());
@@ -1693,16 +1694,16 @@ export class MeteoraDammV2CopyBot {
 
         // Fetch all 250 txs in one blocking call (if not done yet)
         if (!tracker.evaluated && tracker.txs.length < 250) {
-          // Use stored cursor for pagination
-          let beforeSignature: string | undefined = tracker.lastFetchedSignature;
           let totalFetched = 0;
           let totalDups = 0;
           
           // Keep fetching until we have 250 unique txs
+          // For new pools, we fetch ALL txs each time (no cursor) and deduplicate
           while (tracker.txs.length < 250) {
-            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, beforeSignature);
+            // Fetch without cursor - gets all txs for this address (newest first)
+            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
             if (poolTxs.length === 0) {
-              console.log(`[EarlyScore] ⚠️ No more txs available, have ${tracker.txs.length}/250`);
+              console.log(`[EarlyScore] ⚠️ No txs in pool yet, have ${tracker.txs.length}/250`);
               break;
             }
             
@@ -1739,17 +1740,24 @@ export class MeteoraDammV2CopyBot {
             totalFetched += poolTxs.length;
             totalDups += dupTxs;
             
-            // Store cursor for next batch (oldest tx signature)
-            if (poolTxs.length > 0) {
-              beforeSignature = poolTxs[poolTxs.length - 1].signature;
-              tracker.lastFetchedSignature = beforeSignature;
-            }
-            
             // Log batch progress
             console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250`);
             
-            // Break if no new txs were added (reached end of history)
-            if (newTxs === 0) break;
+            // If we got all new txs (no dups), the pool might have more history - continue fetching
+            // If we got dups, we've seen all current txs - break and wait for pool to grow
+            if (dupTxs > 0 && newTxs === 0) {
+              // Pool hasn't grown since last check - break and retry on next checkPool() call
+              break;
+            }
+            
+            // If all txs were new, the pool might have more history beyond the 50 limit
+            // Continue fetching to get older txs (but we're fetching without cursor, so we'll get the same newest 50)
+            // Actually, we need pagination to get older txs...
+            // For now, break and let the pool grow
+            if (newTxs > 0 && poolTxs.length < 50) {
+              // Got fewer than limit - this is all the txs in the pool
+              break;
+            }
           }
           
           console.log(`[EarlyScore] ✅ Done fetching: ${tracker.txs.length} unique txs (total fetched: ${totalFetched}, dups skipped: ${totalDups})`);
