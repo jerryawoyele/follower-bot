@@ -243,6 +243,7 @@ type FollowState = {
   // Breakout protection
   intervalsSinceEntry: number; // How many pool checks since entry
   peakMomentum: number; // Highest momentum seen since entry
+  intervalsSincePeakMomentum: number; // How many intervals since peak momentum (for override expiry)
   // Post-entry validation (Stage 1 vs Stage 2)
   entryStage: 1 | 2; // Which stage triggered the buy
   entryTime: number; // Timestamp of entry (ms)
@@ -1986,6 +1987,9 @@ export class MeteoraDammV2CopyBot {
         // Track peak momentum for strong trend override
         if (momentumScore > position.peakMomentum) {
           position.peakMomentum = momentumScore;
+          position.intervalsSincePeakMomentum = 0; // Reset when new peak
+        } else {
+          position.intervalsSincePeakMomentum++; // Increment when not beating peak
         }
         
         // Track momentum history
@@ -2096,11 +2100,28 @@ export class MeteoraDammV2CopyBot {
           position.consecutiveSells === 1 &&
           momentumScore > -4;
 
-        // Strong trend override: if we had strong momentum (>5), ignore first sell
-        const strongTrendOverride = 
-          position.peakMomentum > 5 &&
-          position.consecutiveSells === 1 &&
-          momentumScore > -4;
+        // Strong trend override: conditional, not just based on old peakMom
+        // Only allow override if:
+        // 1. NOT a severe dump (move > -8% or impact > 5%)
+        // 2. Peak momentum is fresh (within 3 intervals)
+        // 3. No sell structure broken (consecSells < 2)
+        // 4. Current momentum not too negative (>= -3)
+        // 5. Has fresh buy support (consecBuys >= 2 recently)
+        const severeDump = priceMovePct <= -0.08 || quoteImpactPct >= 0.05;
+        const staleTrend = position.intervalsSincePeakMomentum > 3;
+        const weakCurrentMomentum = momentumScore <= -3;
+        const sellStructureBroken = position.consecutiveSells >= 2 || position.trendBroken;
+        const hasFreshBuySupport = position.consecutiveBuys >= 2 && !weakCurrentMomentum;
+        
+        const allowStrongTrendOverride = 
+          !severeDump &&
+          !staleTrend &&
+          !sellStructureBroken &&
+          !weakCurrentMomentum &&
+          hasFreshBuySupport &&
+          position.peakMomentum > 5;
+
+        const strongTrendOverride = allowStrongTrendOverride && position.consecutiveSells === 1;
 
         // ===== TREND BREAK DETECTION =====
         // Only trend broken when confirmed weakness (not just single sell)
@@ -2254,6 +2275,7 @@ export class MeteoraDammV2CopyBot {
       // Breakout protection
       intervalsSinceEntry: 0,
       peakMomentum: 0,
+      intervalsSincePeakMomentum: 0,
       // Post-entry validation
       entryStage: entryStage,
       entryTime: Date.now(),
@@ -2570,6 +2592,7 @@ export class MeteoraDammV2CopyBot {
       // Breakout protection
       intervalsSinceEntry: 0,
       peakMomentum: 0,
+      intervalsSincePeakMomentum: 0,
       // Post-entry validation
       entryStage: 1, // Direct copy uses Stage 1
       entryTime: Date.now(),
