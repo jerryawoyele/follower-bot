@@ -1512,6 +1512,10 @@ export class MeteoraDammV2CopyBot {
     }
   }
 
+  // Meteora DAMM v2 Pool Authority - this is the fixed address that processes all swaps
+  // When this address is the fromUserAccount in tokenTransfers, the toUserAccount is the user wallet
+  private static readonly METEORA_POOL_AUTHORITY = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC";
+
   // Fetch transactions for a pool with wallet addresses
   // Uses cursor-based paging - fetches txs newer than the cursor for growing pools
   private async fetchPoolTransactions(poolAddress: string, afterSignature?: string): Promise<PoolTx[]> {
@@ -1538,7 +1542,9 @@ export class MeteoraDammV2CopyBot {
         let amount = 0;
         let wallet: string | undefined;
         
-        // Method 1: Check tokenTransfers for swap direction
+        // Method 1: Check tokenTransfers - find user wallet via Meteora Pool Authority
+        // The Pool Authority (HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC) processes all swaps
+        // When it's the fromUserAccount, the toUserAccount is the user wallet
         if (tx.tokenTransfers && tx.tokenTransfers.length >= 2) {
           const first = tx.tokenTransfers[0];
           const second = tx.tokenTransfers[1];
@@ -1548,34 +1554,29 @@ export class MeteoraDammV2CopyBot {
           const tokenTransfer = first.mint !== SOL_MINT ? first : second.mint !== SOL_MINT ? second : null;
           
           if (solTransfer && tokenTransfer) {
-            // Determine direction based on who is sending SOL
-            if (solTransfer.fromUserAccount && solTransfer.toUserAccount) {
-              // If SOL is going TO the pool address, it's a BUY
-              // If SOL is coming FROM the pool address, it's a SELL
-              if (solTransfer.toUserAccount === poolAddress) {
-                side = "buy";
-                amount = solTransfer.tokenAmount || 0;
-                wallet = solTransfer.fromUserAccount;
-              } else if (solTransfer.fromUserAccount === poolAddress) {
-                side = "sell";
-                amount = solTransfer.tokenAmount || 0;
-                wallet = tokenTransfer.fromUserAccount;
-                console.log(`[Pool] 🟢 DETECTED SELL via tokenTransfers: ${tx.signature.slice(0, 8)}... SOL from pool, wallet=${wallet?.slice(0, 8)}`);
-              } else {
-                // Neither from nor to is pool - check token transfer direction
-                // If token is going TO pool, it's a SELL
-                if (tokenTransfer.toUserAccount === poolAddress) {
-                  side = "sell";
-                  amount = solTransfer.tokenAmount || 0;
-                  wallet = tokenTransfer.fromUserAccount;
-                  console.log(`[Pool] 🟢 DETECTED SELL via token to pool: ${tx.signature.slice(0, 8)}... token to pool, wallet=${wallet?.slice(0, 8)}`);
-                } else {
-                  // Default to buy
-                  side = "buy";
-                  amount = solTransfer.tokenAmount || 0;
-                  wallet = solTransfer.fromUserAccount;
-                }
-              }
+            // Find the user wallet - look for transfer where Pool Authority is the sender
+            // User is the toUserAccount when Pool Authority sends
+            const poolAuthority = MeteoraDammV2CopyBot.METEORA_POOL_AUTHORITY;
+            if (solTransfer.fromUserAccount === poolAuthority) {
+              // Pool Authority sent SOL - user received SOL = SELL
+              wallet = solTransfer.toUserAccount;
+              side = "sell";
+              amount = solTransfer.tokenAmount || 0;
+            } else if (tokenTransfer.fromUserAccount === poolAuthority) {
+              // Pool Authority sent token - user received token = BUY
+              wallet = tokenTransfer.toUserAccount;
+              side = "buy";
+              amount = solTransfer.tokenAmount || 0;
+            } else if (solTransfer.toUserAccount === poolAuthority) {
+              // Pool Authority received SOL - user sent SOL = BUY
+              wallet = solTransfer.fromUserAccount;
+              side = "buy";
+              amount = solTransfer.tokenAmount || 0;
+            } else if (tokenTransfer.toUserAccount === poolAuthority) {
+              // Pool Authority received token - user sent token = SELL
+              wallet = tokenTransfer.fromUserAccount;
+              side = "sell";
+              amount = solTransfer.tokenAmount || 0;
             }
           }
         }
