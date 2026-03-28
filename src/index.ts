@@ -151,6 +151,10 @@ type TokenEarlyMetrics = {
   decision: "good" | "bad" | "pending" | "watchlist" | "none";
   evaluated: boolean;
   
+  // Fetch tracking for retry logic
+  firstFetchAt?: number; // Timestamp of first fetch attempt
+  retryFetchDone?: boolean; // Whether retry was attempted
+  
   // State machine for sophisticated classification
   state: TokenState;
   prevKnownHits: number; // Known hits from previous check (for delta)
@@ -1747,22 +1751,21 @@ export class MeteoraDammV2CopyBot {
           console.log(`[EarlyScore] 🔄 Fetching 250 token txs at once for ${mint.slice(0, 8)}...`);
         }
 
-        // Fetch all 250 txs from TOKEN MINT address in ONE request
-        if (!tracker.evaluated && tracker.txs.length === 0) {
-          // Fetch all 250 txs at once
+        // Fetch all 250 txs from TOKEN MINT address in ONE request (only once)
+        // If token is brand new, wait before retrying
+        const timeSinceFirstFetch = tracker.firstFetchAt ? Date.now() - tracker.firstFetchAt : 0;
+        const RETRY_DELAY = 30000; // 30 seconds before retry
+        
+        if (!tracker.evaluated && tracker.txs.length === 0 && !tracker.firstFetchAt) {
+          // First fetch attempt
+          tracker.firstFetchAt = Date.now();
           const tokenTxs = await this.fetchTokenTransactions(mint);
           
           let validTxs = 0;
-          let filteredTxs = 0;
           
           for (const tokenTx of tokenTxs) {
-            // Skip if already seen (shouldn't happen with fresh fetch)
-            if (tracker.seenSignatures.has(tokenTx.signature)) {
-              continue;
-            }
+            if (tracker.seenSignatures.has(tokenTx.signature)) continue;
             tracker.seenSignatures.add(tokenTx.signature);
-            
-            // Count valid txs (filtered amounts already handled in fetchTokenTransactions)
             validTxs++;
             
             const earlyTx: EarlyTx = {
@@ -1780,7 +1783,47 @@ export class MeteoraDammV2CopyBot {
             }
           }
           
-          console.log(`[EarlyScore] � Fetched: ${tokenTxs.length} txs | Valid (non-115624): ${validTxs} | Total tracked: ${tracker.txs.length}`);
+          console.log(`[EarlyScore] 📊 Fetched: ${tokenTxs.length} txs | Valid (non-115624): ${validTxs} | Total tracked: ${tracker.txs.length}`);
+          
+          // If still 0 txs, token is brand new - will retry after delay
+          if (tracker.txs.length === 0) {
+            console.log(`[Bot] ⏳ ${mint.slice(0, 8)}... Token is BRAND NEW (0 txs), will retry in ${RETRY_DELAY/1000}s`);
+          }
+        } else if (tracker.txs.length === 0 && timeSinceFirstFetch >= RETRY_DELAY && !tracker.retryFetchDone) {
+          // Retry fetch after delay (token might have txs now)
+          console.log(`[EarlyScore] 🔄 Retrying fetch for ${mint.slice(0, 8)}... after ${RETRY_DELAY/1000}s`);
+          tracker.retryFetchDone = true;
+          
+          const tokenTxs = await this.fetchTokenTransactions(mint);
+          
+          let validTxs = 0;
+          for (const tokenTx of tokenTxs) {
+            if (tracker.seenSignatures.has(tokenTx.signature)) continue;
+            tracker.seenSignatures.add(tokenTx.signature);
+            validTxs++;
+            
+            const earlyTx: EarlyTx = {
+              signature: tokenTx.signature,
+              ts: tokenTx.timestamp * 1000,
+              from: tokenTx.wallet,
+              side: tokenTx.side,
+              amount: tokenTx.amount,
+            };
+            this.updateEarlyMetrics(tracker, earlyTx);
+            
+            if (tokenTx.wallet && this.insiderWalletSet.has(tokenTx.wallet)) {
+              console.log(`[EarlyScore] 🟪 INSIDER ${tokenTx.side.toUpperCase()}: ${tokenTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+            }
+          }
+          
+          console.log(`[EarlyScore] 📊 Retry fetch: ${tokenTxs.length} txs | Valid: ${validTxs} | Total tracked: ${tracker.txs.length}`);
+          
+          // If still 0 after retry, reject
+          if (tracker.txs.length === 0) {
+            console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (0 txs after retry, token may be broken)`);
+            tracker.evaluated = true;
+            continue;
+          }
         }
 
         // Check if we have enough txs - make buy decision
@@ -1811,9 +1854,16 @@ export class MeteoraDammV2CopyBot {
           }
         }
         
-        // If we couldn't get 250 txs (token too new), reject
-        if (tracker.txs.length < 250 && !tracker.evaluated) {
-          console.log(`[Bot] ⏳ ${mint.slice(0, 8)}... Only ${tracker.txs.length} txs for token, waiting...`);
+        // If we have some txs but < 250, reject (not enough data)
+        if (tracker.txs.length > 0 && tracker.txs.length < 250 && !tracker.evaluated) {
+          console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (only ${tracker.txs.length} txs, need 250 for accurate dominance)`);
+          tracker.evaluated = true;
+          continue;
+        }
+        
+        // Waiting for retry delay (silent - don't spam logs)
+        if (tracker.txs.length === 0 && !tracker.retryFetchDone && timeSinceFirstFetch < RETRY_DELAY) {
+          // Silent - avoid log spam
         }
 
         pending.prevPoolSnapshot = snapshot;
