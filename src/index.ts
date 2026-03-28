@@ -1826,11 +1826,18 @@ export class MeteoraDammV2CopyBot {
           
           if (tracker.state === "LATE_IGNITION" && tracker.txs.length >= 20) {
             // LATE IGNITION: Buy after ignition confirmed
-            // But reject if no known wallet support
+            // But reject if no known wallet support OR decision is bad
             const hasKnownSupport = tracker.knownWalletHits > 0 || tracker.leaderWalletHits > 0 || tracker.followerWalletHits > 0;
             
             if (!hasKnownSupport) {
               console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (LATE_IGNITION but no known wallet support)`);
+              tracker.state = "REJECTED";
+              tracker.evaluated = true;
+              continue;
+            }
+            
+            if (tracker.decision === "bad") {
+              console.log(`[Bot] 🔴 STAGE 1 REJECT: ${mint.slice(0, 8)}... (LATE_IGNITION but decision=bad)`);
               tracker.state = "REJECTED";
               tracker.evaluated = true;
               continue;
@@ -2069,9 +2076,10 @@ export class MeteoraDammV2CopyBot {
               await this.copySell(mint, "VALIDATION_FAILED", 100);
               continue;
             } else {
-              // Weak but not terrible - mark validated but with low confidence
-              position.postEntryValidated = true;
-              console.log(`[Bot] ⚠️ POST-ENTRY WEAK: ${mint.slice(0, 8)}... (stage=1 validated with low confidence)`);
+              // Weak validation - exit with low confidence rather than holding
+              console.log(`[Bot] ❌ POST-ENTRY WEAK EXIT: ${mint.slice(0, 8)}... (stage=1 weak structure, slope=${momSlope.toFixed(1)} peakMom=${position.peakMomentum.toFixed(1)})`);
+              await this.copySell(mint, "WEAK_VALIDATION", 100);
+              continue;
             }
           } else {
             // Stage 2 buys are pre-validated by momentum confirmation
