@@ -1931,7 +1931,7 @@ export class MeteoraDammV2CopyBot {
             
             // Check if both buys and sells have reached 48 SOL - trigger early exit
             if (cumBuySol >= 48 && cumSellSol >= 48) {
-              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= 50 SOL, sells: ${cumSellSol.toFixed(4)} SOL >= 50 SOL)`);
+              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= 48 SOL, sells: ${cumSellSol.toFixed(4)} SOL >= 48 SOL)`);
               this.logDominanceStats(mint, "Exit-Volume");
               await this.copySell(mint, "VOLUME_EXIT", 100);
               continue;
@@ -1940,7 +1940,7 @@ export class MeteoraDammV2CopyBot {
         }
         
         // Check if 30 batches passed without reaching 20% highest profit - exit
-        if (position.batchCount >= 30 && position.highestProfit < 20) {
+        if (position.batchCount >= 25 && position.highestProfit < 20) {
           console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < 20%)`);
           this.logDominanceStats(mint, "Exit-Stagnant");
           await this.copySell(mint, "STAGNANT_EXIT", 100);
