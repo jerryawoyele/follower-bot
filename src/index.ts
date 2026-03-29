@@ -1811,6 +1811,7 @@ export class MeteoraDammV2CopyBot {
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
             console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% dominance >= 90% threshold)`);
+            tracker.evaluated = true; // Mark as evaluated to prevent re-buy
             this.pendingPositions.delete(mint);
             this.attemptedBuys.add(mint);
             await this.copyBuyFromPending(pending, 1);
@@ -1842,14 +1843,44 @@ export class MeteoraDammV2CopyBot {
       try {
         // Fetch recent pool txs to log insider activity for open positions
         const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
+        let newInsiderTxs = 0;
+        
         for (const poolTx of poolTxs) {
           // Skip if already seen
           const seenKey = `open:${mint}:${poolTx.signature}`;
           if (this.insiderWalletSet.has(poolTx.wallet || "") && !this.seenOpenInsiderTxs?.has(seenKey)) {
             if (!this.seenOpenInsiderTxs) this.seenOpenInsiderTxs = new Set();
             this.seenOpenInsiderTxs.add(seenKey);
+            newInsiderTxs++;
+            
+            // Update tracker with new tx for cumulative stats
+            const tracker = this.earlyMetricsMap.get(mint);
+            if (tracker && poolTx.wallet) {
+              const earlyTx: EarlyTx = {
+                signature: poolTx.signature,
+                ts: poolTx.timestamp * 1000,
+                from: poolTx.wallet,
+                side: poolTx.side,
+                amount: poolTx.amount,
+              };
+              this.updateEarlyMetrics(tracker, earlyTx);
+            }
+            
             const solAmount = (poolTx.amount || 0).toFixed(6);
             console.log(`[OpenPos] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet?.slice(0, 8)}... on ${mint.slice(0, 8)}...`);
+          }
+        }
+        
+        // Log cumulative insider stats for this batch
+        if (newInsiderTxs > 0) {
+          const tracker = this.earlyMetricsMap.get(mint);
+          if (tracker) {
+            const cumInsiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
+            const cumInsiderBuys = cumInsiderTxs.filter(tx => tx.side === "buy");
+            const cumInsiderSells = cumInsiderTxs.filter(tx => tx.side === "sell");
+            const cumBuySol = cumInsiderBuys.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+            const cumSellSol = cumInsiderSells.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+            console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
           }
         }
 
