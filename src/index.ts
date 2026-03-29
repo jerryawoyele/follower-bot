@@ -560,6 +560,7 @@ export class MeteoraDammV2CopyBot {
   private readonly followerWalletSet!: Set<string>;
   private readonly insiderWalletSet!: Set<string>;
   private readonly knownWalletSet!: Set<string>;
+  private seenOpenInsiderTxs?: Set<string>; // Track logged insider txs for open positions
   
   // Dynamic wallet classification
   private readonly walletProfiles = new Map<string, WalletProfile>(); // address -> profile
@@ -664,7 +665,7 @@ export class MeteoraDammV2CopyBot {
     
     try {
       // Query token mint directly for first 10 txs (ascending order = oldest first)
-      const url = `${HELIUS_BASE}/addresses/${mint}/transactions?api-key=${this.heliusApiKey}&limit=10&sort-order=asc`;
+      const url = `${HELIUS_BASE}/addresses/${mint}/transactions?api-key=${this.heliusApiKey}&limit=10&sort-order=desc`;
       const resp = await fetch(url);
       if (!resp.ok) return null;
       
@@ -1415,7 +1416,7 @@ export class MeteoraDammV2CopyBot {
     const url = new URL(`https://api-mainnet.helius-rpc.com/v0/addresses/${position.leaderTokenAccount}/transactions`);
     url.searchParams.set("api-key", this.heliusApiKey);
     url.searchParams.set("token-accounts", "none");
-    url.searchParams.set("sort-order", "desc");
+    url.searchParams.set("sort-order", "asc");
     
     if (position.lastCheckedSignature) {
       url.searchParams.set("after-signature", position.lastCheckedSignature);
@@ -1729,9 +1730,10 @@ export class MeteoraDammV2CopyBot {
               };
               this.updateEarlyMetrics(tracker, earlyTx);
               
-              // Log insider wallets (buy or sell)
+              // Log insider wallets (buy or sell) with SOL amount
               if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
-                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()}: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+                const solAmount = (poolTx.amount || 0).toFixed(6);
+                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
               }
               
               // Stop at 250
@@ -1767,15 +1769,20 @@ export class MeteoraDammV2CopyBot {
         // Check if we have 250 txs - make buy decision
         if (tracker.txs.length >= 250 && !tracker.evaluated) {
           // Count insider txs (both buy AND sell) from FULL pool activity
-          const insiderTxCount = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from)).length;
+          const insiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
+          const insiderTxCount = insiderTxs.length;
           const insiderPercent = (insiderTxCount / tracker.txs.length) * 100;
           
-          // Count insider buys vs sells
-          const insiderBuys = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "buy").length;
-          const insiderSells = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from) && tx.side === "sell").length;
+          // Count insider buys vs sells with total SOL amounts
+          const insiderBuyTxs = insiderTxs.filter(tx => tx.side === "buy");
+          const insiderSellTxs = insiderTxs.filter(tx => tx.side === "sell");
+          const insiderBuys = insiderBuyTxs.length;
+          const insiderSells = insiderSellTxs.length;
+          const totalInsiderBuySol = insiderBuyTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+          const totalInsiderSellSol = insiderSellTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
           
           console.log(`[EarlyScore] ✅ ${mint.slice(0, 8)}... HAVE ${tracker.txs.length} POOL TXS`);
-          console.log(`[EarlyScore] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys, ${insiderSells} sells) | dominancePct=${insiderPercent.toFixed(1)}%`);
+          console.log(`[EarlyScore] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuys} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSells} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
           
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
@@ -1809,6 +1816,19 @@ export class MeteoraDammV2CopyBot {
       if (!position.poolAddress) continue;
 
       try {
+        // Fetch recent pool txs to log insider activity for open positions
+        const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
+        for (const poolTx of poolTxs) {
+          // Skip if already seen
+          const seenKey = `open:${mint}:${poolTx.signature}`;
+          if (this.insiderWalletSet.has(poolTx.wallet || "") && !this.seenOpenInsiderTxs?.has(seenKey)) {
+            if (!this.seenOpenInsiderTxs) this.seenOpenInsiderTxs = new Set();
+            this.seenOpenInsiderTxs.add(seenKey);
+            const solAmount = (poolTx.amount || 0).toFixed(6);
+            console.log(`[OpenPos] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet?.slice(0, 8)}... on ${mint.slice(0, 8)}...`);
+          }
+        }
+
         // Get real pool state from CpAmm SDK
         const snapshot = await this.getPoolSnapshot(position.poolAddress);
         if (!snapshot) continue;
