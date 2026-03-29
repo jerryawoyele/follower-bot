@@ -168,6 +168,7 @@ type TokenEarlyMetrics = {
   priceHigh?: number; // Highest price seen (for breakout detection)
   consecutiveBuySamples: number; // Pool samples with consecutive buy pressure
   walletAcceleration: number; // Rate of new unique wallets
+  initialPrice?: number; // Price at first detection (for rug detection)
 };
 
 // Pool snapshot for monitoring
@@ -1707,8 +1708,17 @@ export class MeteoraDammV2CopyBot {
         let tracker = this.earlyMetricsMap.get(mint);
         if (!tracker) {
           tracker = this.createEarlyMetrics(mint, pending.poolAddress);
+          tracker.initialPrice = snapshot.price; // Store initial price for rug detection
           this.earlyMetricsMap.set(mint, tracker);
-          console.log(`[EarlyScore] 🔄 Fetching first 250 pool txs for ${mint.slice(0, 8)}...`);
+          console.log(`[EarlyScore] 🔄 Fetching first 250 pool txs for ${mint.slice(0, 8)}... (initialPrice=${snapshot.price.toFixed(9)})`);
+        }
+        
+        // Check for 50% price drop (rug detection)
+        if (tracker.initialPrice && snapshot.price < tracker.initialPrice * 0.5) {
+          console.log(`[Bot] 🔴 RUG DETECTED: ${mint.slice(0, 8)}... (price dropped 50%: ${tracker.initialPrice.toFixed(9)} → ${snapshot.price.toFixed(9)})`);
+          tracker.evaluated = true;
+          this.pendingPositions.delete(mint);
+          continue;
         }
 
         // Fetch all 250 txs in one blocking call (if not done yet)
@@ -1829,6 +1839,20 @@ export class MeteoraDammV2CopyBot {
           
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
+            // But check minimum SOL thresholds first
+            if (totalInsiderBuySol < 12.5) {
+              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider buys ${totalInsiderBuySol.toFixed(4)} SOL < 12.5 SOL minimum)`);
+              tracker.evaluated = true;
+              this.pendingPositions.delete(mint);
+              continue;
+            }
+            if (totalInsiderSellSol < 11.5) {
+              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider sells ${totalInsiderSellSol.toFixed(4)} SOL < 11.5 SOL minimum)`);
+              tracker.evaluated = true;
+              this.pendingPositions.delete(mint);
+              continue;
+            }
+            
             console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% dominance >= 90% threshold)`);
             tracker.evaluated = true; // Mark as evaluated to prevent re-buy
             this.pendingPositions.delete(mint);
