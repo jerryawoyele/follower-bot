@@ -1840,8 +1840,8 @@ export class MeteoraDammV2CopyBot {
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
             // But check minimum SOL thresholds first
-            if (totalInsiderBuySol < 12.5) {
-              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider buys ${totalInsiderBuySol.toFixed(4)} SOL < 12.5 SOL minimum)`);
+            if (totalInsiderBuySol < 13) {
+              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider buys ${totalInsiderBuySol.toFixed(4)} SOL < 13 SOL minimum)`);
               tracker.evaluated = true;
               this.pendingPositions.delete(mint);
               continue;
@@ -1925,7 +1925,7 @@ export class MeteoraDammV2CopyBot {
             const cumSellSol = cumInsiderSells.reduce((sum, tx) => sum + (tx.amount || 0), 0);
             console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
-            // Check if both buys and sells have reached 50 SOL - trigger early exit
+            // Check if both buys and sells have reached 48 SOL - trigger early exit
             if (cumBuySol >= 48 && cumSellSol >= 48) {
               console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= 50 SOL, sells: ${cumSellSol.toFixed(4)} SOL >= 50 SOL)`);
               this.logDominanceStats(mint, "Exit-Volume");
