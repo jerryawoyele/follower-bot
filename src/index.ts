@@ -1513,6 +1513,23 @@ export class MeteoraDammV2CopyBot {
     }
   }
 
+  // Helper to log dominance stats for a mint (used at exit triggers)
+  private logDominanceStats(mint: string, label: string): void {
+    const tracker = this.earlyMetricsMap.get(mint);
+    if (!tracker) return;
+    
+    const insiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
+    const insiderTxCount = insiderTxs.length;
+    const insiderPercent = tracker.txs.length > 0 ? (insiderTxCount / tracker.txs.length) * 100 : 0;
+    
+    const insiderBuyTxs = insiderTxs.filter(tx => tx.side === "buy");
+    const insiderSellTxs = insiderTxs.filter(tx => tx.side === "sell");
+    const totalInsiderBuySol = insiderBuyTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+    const totalInsiderSellSol = insiderSellTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+    
+    console.log(`[${label}] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuyTxs.length} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSellTxs.length} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
+  }
+
   // Meteora DAMM v2 Pool Authority - this is the fixed address that processes all swaps
   // When this address is the fromUserAccount in tokenTransfers, the toUserAccount is the user wallet
   private static readonly METEORA_POOL_AUTHORITY = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC";
@@ -1743,8 +1760,15 @@ export class MeteoraDammV2CopyBot {
             totalFetched += poolTxs.length;
             totalDups += dupTxs;
             
-            // Log batch progress
-            console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250`);
+            // Calculate cumulative insider stats for batch log
+            const cumInsiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
+            const cumInsiderBuys = cumInsiderTxs.filter(tx => tx.side === "buy");
+            const cumInsiderSells = cumInsiderTxs.filter(tx => tx.side === "sell");
+            const cumBuySol = cumInsiderBuys.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+            const cumSellSol = cumInsiderSells.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+            
+            // Log batch progress with cumulative insider stats
+            console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250 | Insider: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
             // If we got all new txs (no dups), the pool might have more history - continue fetching
             // If we got dups, we've seen all current txs - break and wait for pool to grow
@@ -1869,12 +1893,14 @@ export class MeteoraDammV2CopyBot {
           // Check TP1
           if (!position.tp1Hit && currentMultiplier >= tp1Trigger) {
             position.tp1Hit = true;
+            this.logDominanceStats(mint, "Exit-TP1");
             console.log(`[Bot] 🎯 TP1 HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, selling ${tp1SellPercent}%)`);
             await this.copySell(mint, "TP1", tp1SellPercent);
           }
           
           // Check TP2 (only after TP1)
           if (position.tp1Hit && currentMultiplier >= tp2Trigger) {
+            this.logDominanceStats(mint, "Exit-TP2");
             console.log(`[Bot] 🎯 TP2 HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, selling remaining)`);
             await this.copySell(mint, "TP2", 100);
             continue;
@@ -1882,6 +1908,7 @@ export class MeteoraDammV2CopyBot {
           
           // Check Stop Loss
           if (currentMultiplier <= slTrigger) {
+            this.logDominanceStats(mint, "Exit-SL");
             console.log(`[Bot] 🛑 SL HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry)`);
             await this.copySell(mint, "STOP_LOSS", 100);
             continue;
@@ -1894,6 +1921,7 @@ export class MeteoraDammV2CopyBot {
             const floorPrice = position.entryPrice * smartSlFloor;
             
             if (snapshot.price <= position.entryPrice * trailingSl && snapshot.price > floorPrice) {
+              this.logDominanceStats(mint, "Exit-SmartSL");
               console.log(`[Bot] 🔒 SMART SL HIT: ${mint.slice(0, 8)}... (${(currentMultiplier * 100).toFixed(1)}% of entry, trailing from ${position.highestProfit.toFixed(1)}%)`);
               await this.copySell(mint, "SMART_SL", 100);
               continue;
