@@ -1770,6 +1770,14 @@ export class MeteoraDammV2CopyBot {
             // Log batch progress with cumulative insider stats
             console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250 | Insider: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
+            // Early rejection: if we have 20+ txs and 0 insider activity, stop looking
+            if (tracker.txs.length >= 20 && cumInsiderTxs.length === 0) {
+              console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (${tracker.txs.length} txs, 0 insider activity - pool likely rugged)`);
+              tracker.evaluated = true;
+              this.pendingPositions.delete(mint);
+              break;
+            }
+            
             // If we got all new txs (no dups), the pool might have more history - continue fetching
             // If we got dups, we've seen all current txs - break and wait for pool to grow
             if (dupTxs > 0 && newTxs === 0) {
