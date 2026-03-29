@@ -1771,8 +1771,19 @@ export class MeteoraDammV2CopyBot {
             console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250 | Insider: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
             // Early rejection: if we have 20+ txs and 0 insider activity, stop looking
+            // Also reject if 3 minutes passed with 0 insider activity
+            const elapsedMs = Date.now() - tracker.startedAt;
+            const elapsedMin = elapsedMs / 60000;
+            
             if (tracker.txs.length >= 20 && cumInsiderTxs.length === 0) {
               console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (${tracker.txs.length} txs, 0 insider activity - pool likely rugged)`);
+              tracker.evaluated = true;
+              this.pendingPositions.delete(mint);
+              break;
+            }
+            
+            if (elapsedMin >= 3 && cumInsiderTxs.length === 0) {
+              console.log(`[Bot] 🔴 REJECT TIMEOUT: ${mint.slice(0, 8)}... (${elapsedMin.toFixed(1)}min elapsed, 0 insider activity)`);
               tracker.evaluated = true;
               this.pendingPositions.delete(mint);
               break;
