@@ -246,6 +246,7 @@ type FollowState = {
   intervalsSinceEntry: number; // How many pool checks since entry
   peakMomentum: number; // Highest momentum seen since entry
   intervalsSincePeakMomentum: number; // How many intervals since peak momentum (for override expiry)
+  batchCount: number; // Number of batch requests made after buy trigger
   // Post-entry validation (Stage 1 vs Stage 2)
   entryStage: 1 | 2; // Which stage triggered the buy
   entryTime: number; // Timestamp of entry (ms)
@@ -1918,12 +1919,15 @@ export class MeteoraDammV2CopyBot {
         if (newInsiderTxs > 0) {
           const tracker = this.earlyMetricsMap.get(mint);
           if (tracker) {
+            // Increment batch count
+            position.batchCount = (position.batchCount || 0) + 1;
+            
             const cumInsiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
             const cumInsiderBuys = cumInsiderTxs.filter(tx => tx.side === "buy");
             const cumInsiderSells = cumInsiderTxs.filter(tx => tx.side === "sell");
             const cumBuySol = cumInsiderBuys.reduce((sum, tx) => sum + (tx.amount || 0), 0);
             const cumSellSol = cumInsiderSells.reduce((sum, tx) => sum + (tx.amount || 0), 0);
-            console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
+            console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL | batchCount=${position.batchCount}`);
             
             // Check if both buys and sells have reached 48 SOL - trigger early exit
             if (cumBuySol >= 48 && cumSellSol >= 48) {
@@ -1933,6 +1937,14 @@ export class MeteoraDammV2CopyBot {
               continue;
             }
           }
+        }
+        
+        // Check if 30 batches passed without reaching 20% highest profit - exit
+        if (position.batchCount >= 30 && position.highestProfit < 20) {
+          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < 20%)`);
+          this.logDominanceStats(mint, "Exit-Stagnant");
+          await this.copySell(mint, "STAGNANT_EXIT", 100);
+          continue;
         }
 
         // Get real pool state from CpAmm SDK
@@ -2139,6 +2151,8 @@ export class MeteoraDammV2CopyBot {
       insiderBuysThisInterval: 0,
       insiderBuysPrevInterval: 0,
       peakInsiderBuyRate: 0,
+      // Batch count tracking
+      batchCount: 0,
     });
 
     console.log(
@@ -2464,6 +2478,8 @@ export class MeteoraDammV2CopyBot {
       insiderBuysThisInterval: 0,
       insiderBuysPrevInterval: 0,
       peakInsiderBuyRate: 0,
+      // Batch count tracking
+      batchCount: 0,
     });
 
     console.log(
