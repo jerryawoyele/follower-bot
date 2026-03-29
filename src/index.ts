@@ -1926,7 +1926,7 @@ export class MeteoraDammV2CopyBot {
             console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
             // Check if both buys and sells have reached 50 SOL - trigger early exit
-            if (cumBuySol >= 50 && cumSellSol >= 50) {
+            if (cumBuySol >= 48 && cumSellSol >= 48) {
               console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= 50 SOL, sells: ${cumSellSol.toFixed(4)} SOL >= 50 SOL)`);
               this.logDominanceStats(mint, "Exit-Volume");
               await this.copySell(mint, "VOLUME_EXIT", 100);
