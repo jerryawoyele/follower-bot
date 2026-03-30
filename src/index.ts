@@ -1548,45 +1548,50 @@ export class MeteoraDammV2CopyBot {
     console.log(`[${label}] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuyTxs.length} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSellTxs.length} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
   }
 
-  // Token Program ID for SPL tokens
+  // Token Program IDs for SPL tokens
   private static readonly TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+  private static readonly TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbL2PSCveLdprNQxYfGP3ii4pB6Saa5AHnN");
 
   // Get holder count for a token mint using getProgramAccounts
+  // Queries both Token-2022 and classic SPL Token programs
   private async getHolderCount(mintAddress: string): Promise<number> {
     try {
       const mint = new PublicKey(mintAddress);
-      
-      const accounts = await this.connection.getProgramAccounts(MeteoraDammV2CopyBot.TOKEN_PROGRAM_ID, {
-        filters: [
-          { dataSize: 165 }, // Standard SPL token account size
-          {
-            memcmp: {
-              offset: 0,
-              bytes: mint.toBase58(),
-            },
-          },
-        ],
-        encoding: "base64",
-      });
-
       const uniqueOwners = new Set<string>();
 
-      for (const acc of accounts) {
-        // Token account layout: mint (32) + owner (32) + amount (8) + ...
-        // Owner starts at offset 32
-        // With base64 encoding, data is returned as [data: string, encoding: string]
-        const dataArr = acc.account.data as unknown as [string, string];
-        const data = Buffer.from(dataArr[0], "base64");
-        if (data.length < 72) continue;
-        
-        // Read amount (u64 at offset 64)
-        const amount = data.readBigUInt64LE(64);
-        if (amount === 0n) continue;
-        
-        // Read owner (32 bytes at offset 32)
-        const ownerPubkey = new PublicKey(data.subarray(32, 64));
-        uniqueOwners.add(ownerPubkey.toBase58());
-      }
+      const fetchOwners = async (programId: PublicKey, useDataSize165: boolean) => {
+        try {
+          const accounts = await this.connection.getProgramAccounts(programId, {
+            filters: [
+              ...(useDataSize165 ? [{ dataSize: 165 }] : []),
+              {
+                memcmp: {
+                  offset: 0,
+                  bytes: mint.toBase58(),
+                },
+              },
+            ],
+          });
+
+          for (const acc of accounts) {
+            const parsed = (acc.account.data as any)?.parsed;
+            const info = parsed?.info;
+            const owner = info?.owner as string | undefined;
+            const amount = info?.tokenAmount?.amount as string | undefined;
+
+            if (!owner || !amount) continue;
+            if (amount === "0") continue;
+
+            uniqueOwners.add(owner);
+          }
+        } catch (err: any) {
+          // Silently continue if this program doesn't have accounts for this mint
+        }
+      };
+
+      // Query Token-2022 first (no fixed size), then classic SPL Token (size 165)
+      await fetchOwners(MeteoraDammV2CopyBot.TOKEN_2022_PROGRAM_ID, false);
+      await fetchOwners(MeteoraDammV2CopyBot.TOKEN_PROGRAM_ID, true);
 
       return uniqueOwners.size;
     } catch (err: any) {
