@@ -1548,10 +1548,6 @@ export class MeteoraDammV2CopyBot {
     console.log(`[${label}] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuyTxs.length} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSellTxs.length} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
   }
 
-  // Token Program IDs for SPL tokens
-  private static readonly TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-  private static readonly TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbL2PSCveLdprNQxYfGP3ii4pB6Saa5AHnN");
-
   // Get holder count for a token mint using getProgramAccounts
   // Queries both Token-2022 and classic SPL Token programs
   private async getHolderCount(mintAddress: string): Promise<number> {
@@ -1590,8 +1586,8 @@ export class MeteoraDammV2CopyBot {
       };
 
       // Query Token-2022 first (no fixed size), then classic SPL Token (size 165)
-      await fetchOwners(MeteoraDammV2CopyBot.TOKEN_2022_PROGRAM_ID, false);
-      await fetchOwners(MeteoraDammV2CopyBot.TOKEN_PROGRAM_ID, true);
+      await fetchOwners(TOKEN_2022_PROGRAM_ID, false);
+      await fetchOwners(TOKEN_PROGRAM_ID, true);
 
       return uniqueOwners.size;
     } catch (err: any) {
