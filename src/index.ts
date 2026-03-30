@@ -63,6 +63,10 @@ type BotConfig = {
   volumeExitEnabled?: boolean; // Enable volume exit trigger (default: true)
   volumeExitBuySol?: number; // Minimum insider buy SOL for volume exit (default: 48)
   volumeExitSellSol?: number; // Minimum insider sell SOL for volume exit (default: 48)
+  // Holder count exit params (optional)
+  holderExitEnabled?: boolean; // Enable holder count exit trigger (default: false)
+  holderExitCount?: number; // Number of holders to trigger exit (default: 190)
+  holderExitCheckIntervalMs?: number; // How often to check holder count (default: 30000)
   // Early score engine params
   leaderWallets?: string[]; // High-weight known wallets (score +10 each)
   followerWallets?: string[]; // Lower-weight known wallets (score +4 each)
@@ -268,6 +272,9 @@ type FollowState = {
   insiderBuysThisInterval: number; // Insider buys in current interval
   insiderBuysPrevInterval: number; // Insider buys in previous interval
   peakInsiderBuyRate: number; // Highest insider buy rate seen
+  // Holder count tracking
+  holderCount?: number; // Last known holder count
+  lastHolderCheck?: number; // Timestamp of last holder count check
 };
 
 // Helius API types
@@ -549,6 +556,7 @@ export class JupiterUltraTrader {
 
 export class MeteoraDammV2CopyBot {
   private readonly config: BotConfig;
+  private readonly connection: Connection;
 
   private readonly trader: JupiterUltraTrader;
   private readonly leader: string;
@@ -608,8 +616,8 @@ export class MeteoraDammV2CopyBot {
     
     // Initialize CpAmm with pool RPC URL (separate from main RPC to avoid rate limits)
     const poolRpcUrl = config.poolRpcUrl ?? config.rpcUrl;
-    const connection = new Connection(poolRpcUrl, "processed");
-    this.cpAmm = new CpAmm(connection);
+    this.connection = new Connection(poolRpcUrl, "processed");
+    this.cpAmm = new CpAmm(this.connection);
     
     // Initialize known wallet sets for early score engine
     this.leaderWalletSet = new Set(config.leaderWallets ?? []);
@@ -1540,6 +1548,51 @@ export class MeteoraDammV2CopyBot {
     console.log(`[${label}] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuyTxs.length} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSellTxs.length} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
   }
 
+  // Token Program ID for SPL tokens
+  private static readonly TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+  // Get holder count for a token mint using getProgramAccounts
+  private async getHolderCount(mintAddress: string): Promise<number> {
+    try {
+      const mint = new PublicKey(mintAddress);
+      
+      const accounts = await this.connection.getProgramAccounts(MeteoraDammV2CopyBot.TOKEN_PROGRAM_ID, {
+        filters: [
+          { dataSize: 165 }, // Standard SPL token account size
+          {
+            memcmp: {
+              offset: 0,
+              bytes: mint.toBase58(),
+            },
+          },
+        ],
+        encoding: "base64",
+      });
+
+      const uniqueOwners = new Set<string>();
+
+      for (const acc of accounts) {
+        // Token account layout: mint (32) + owner (32) + amount (8) + ...
+        // Owner starts at offset 32
+        const data = Buffer.from(acc.account.data as any, "base64");
+        if (data.length < 72) continue;
+        
+        // Read amount (u64 at offset 64)
+        const amount = data.readBigUInt64LE(64);
+        if (amount === 0n) continue;
+        
+        // Read owner (32 bytes at offset 32)
+        const ownerPubkey = new PublicKey(data.subarray(32, 64));
+        uniqueOwners.add(ownerPubkey.toBase58());
+      }
+
+      return uniqueOwners.size;
+    } catch (err: any) {
+      console.error(`[Holder] Error fetching holder count for ${mintAddress.slice(0, 8)}...: ${err.message}`);
+      return 0;
+    }
+  }
+
   // Meteora DAMM v2 Pool Authority - this is the fixed address that processes all swaps
   // When this address is the fromUserAccount in tokenTransfers, the toUserAccount is the user wallet
   private static readonly METEORA_POOL_AUTHORITY = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC";
@@ -1942,8 +1995,8 @@ export class MeteoraDammV2CopyBot {
             const volumeExitBuySol = this.config.volumeExitBuySol ?? 48;
             const volumeExitSellSol = this.config.volumeExitSellSol ?? 48;
             
-            if (volumeExitEnabled && cumBuySol >= volumeExitBuySol && cumSellSol >= volumeExitSellSol) {
-              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= ${volumeExitBuySol} SOL, sells: ${cumSellSol.toFixed(4)} SOL >= ${volumeExitSellSol} SOL)`);
+            if (volumeExitEnabled && cumBuySol >= volumeExitBuySol && cumSellSol >= volumeExitSellSol && position.highestProfit > 0) {
+              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= ${volumeExitBuySol} SOL, sells: ${cumSellSol.toFixed(4)} SOL >= ${volumeExitSellSol} SOL, profit: ${position.highestProfit.toFixed(1)}% > 0%)`);
               this.logDominanceStats(mint, "Exit-Volume");
               await this.copySell(mint, "VOLUME_EXIT", 100);
               continue;
@@ -1956,11 +2009,37 @@ export class MeteoraDammV2CopyBot {
         const stagnantExitBatchCount = this.config.stagnantExitBatchCount ?? 20;
         const stagnantExitMinProfit = this.config.stagnantExitMinProfit ?? 20;
         
-        if (stagnantExitEnabled && position.batchCount >= stagnantExitBatchCount && position.highestProfit < stagnantExitMinProfit) {
-          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < ${stagnantExitMinProfit}%)`);
+        if (stagnantExitEnabled && position.batchCount >= stagnantExitBatchCount && position.highestProfit < stagnantExitMinProfit && position.highestProfit > 0) {
+          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < ${stagnantExitMinProfit}%, in profit)`);
           this.logDominanceStats(mint, "Exit-Stagnant");
           await this.copySell(mint, "STAGNANT_EXIT", 100);
           continue;
+        }
+        
+        // Check holder count exit trigger (if enabled)
+        const holderExitEnabled = this.config.holderExitEnabled === true; // default false
+        const holderExitCount = this.config.holderExitCount ?? 190;
+        const holderExitCheckIntervalMs = this.config.holderExitCheckIntervalMs ?? 30000;
+        
+        if (holderExitEnabled) {
+          const now = Date.now();
+          const lastHolderCheck = position.lastHolderCheck ?? 0;
+          
+          // Check holder count at interval
+          if (now - lastHolderCheck >= holderExitCheckIntervalMs) {
+            const holderCount = await this.getHolderCount(mint);
+            position.holderCount = holderCount;
+            position.lastHolderCheck = now;
+            console.log(`[Holder] ${mint.slice(0, 8)}... holderCount=${holderCount}`);
+            
+            // Exit if holder count >= threshold AND in profit
+            if (holderCount >= holderExitCount && position.highestProfit > 0) {
+              console.log(`[Bot] 🚨 HOLDER EXIT TRIGGERED: ${mint.slice(0, 8)}... (holders: ${holderCount} >= ${holderExitCount}, profit: ${position.highestProfit.toFixed(1)}% > 0%)`);
+              this.logDominanceStats(mint, "Exit-Holder");
+              await this.copySell(mint, "HOLDER_EXIT", 100);
+              continue;
+            }
+          }
         }
 
         // Get real pool state from CpAmm SDK
@@ -2637,6 +2716,10 @@ async function main() {
     volumeExitEnabled: process.env.VOLUME_EXIT_ENABLED !== "false", // default true
     volumeExitBuySol: Number(process.env.VOLUME_EXIT_BUY_SOL ?? "48"),
     volumeExitSellSol: Number(process.env.VOLUME_EXIT_SELL_SOL ?? "48"),
+    // Holder exit config
+    holderExitEnabled: process.env.HOLDER_EXIT_ENABLED === "true", // default false
+    holderExitCount: Number(process.env.HOLDER_EXIT_COUNT ?? "190"),
+    holderExitCheckIntervalMs: Number(process.env.HOLDER_EXIT_CHECK_INTERVAL_MS ?? "30000"),
     // Early score engine wallets
     leaderWallets: process.env.LEADER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
     followerWallets: process.env.FOLLOWER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
