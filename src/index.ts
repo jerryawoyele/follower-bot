@@ -1574,7 +1574,9 @@ export class MeteoraDammV2CopyBot {
       for (const acc of accounts) {
         // Token account layout: mint (32) + owner (32) + amount (8) + ...
         // Owner starts at offset 32
-        const data = Buffer.from(acc.account.data as any, "base64");
+        // With base64 encoding, data is returned as [data: string, encoding: string]
+        const dataArr = acc.account.data as unknown as [string, string];
+        const data = Buffer.from(dataArr[0], "base64");
         if (data.length < 72) continue;
         
         // Read amount (u64 at offset 64)
