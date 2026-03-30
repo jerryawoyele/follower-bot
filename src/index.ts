@@ -27,6 +27,7 @@ type BotConfig = {
   heliusApiKey: string;
   privateKey: string;
   jupiterApiKey: string;
+  birdeyeApiKey?: string; // Optional Birdeye API key for holder count
 
   // wallet you are copying
   leaderWallet: string;
@@ -1548,10 +1549,36 @@ export class MeteoraDammV2CopyBot {
     console.log(`[${label}] 📊 DOMINANCE: totalPoolTxs=${tracker.txs.length} | insiderTxs=${insiderTxCount} (${insiderBuyTxs.length} buys: ${totalInsiderBuySol.toFixed(4)} SOL, ${insiderSellTxs.length} sells: ${totalInsiderSellSol.toFixed(4)} SOL) | dominancePct=${insiderPercent.toFixed(1)}%`);
   }
 
-  // Get holder count for a token mint using getProgramAccounts
-  // Queries both Token-2022 and classic SPL Token programs
+  // Get holder count for a token mint using Birdeye API
   private async getHolderCount(mintAddress: string): Promise<number> {
     try {
+      // Use Birdeye API if key is configured
+      if (this.config.birdeyeApiKey) {
+        const url = `https://public-api.birdeye.so/defi/v3/token/market-data?address=${mintAddress}&ui_amount_mode=scaled`;
+        
+        const response = await fetch(url, {
+          headers: {
+            "X-API-KEY": this.config.birdeyeApiKey,
+            "accept": "application/json",
+            "x-chain": "solana",
+          },
+        });
+
+        if (!response.ok) {
+          console.error(`[Holder] Birdeye API error for ${mintAddress.slice(0, 8)}...: ${response.status}`);
+          return 0;
+        }
+
+        const data = await response.json() as any;
+        
+        if (data.success && data.data?.holder !== undefined) {
+          return data.data.holder;
+        }
+        
+        return 0;
+      }
+
+      // Fallback to getProgramAccounts if no Birdeye API key
       const mint = new PublicKey(mintAddress);
       const uniqueOwners = new Set<string>();
 
@@ -2692,6 +2719,7 @@ async function main() {
     heliusApiKey: process.env.HELIUS_API_KEY!,
     privateKey: process.env.PRIVATE_KEY!,
     jupiterApiKey: process.env.JUPITER_API_KEY!,
+    birdeyeApiKey: process.env.BIRDEYE_API_KEY,
     leaderWallet: process.env.LEADER_WALLET!,
     buyAmountLamports: solToLamports(process.env.BUY_AMOUNT_SOL ?? "0.01"),
     slippageBps: Number(process.env.SLIPPAGE_BPS ?? "1000"),
