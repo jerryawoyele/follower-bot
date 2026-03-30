@@ -182,6 +182,8 @@ type TokenEarlyMetrics = {
   consecutiveBuySamples: number; // Pool samples with consecutive buy pressure
   walletAcceleration: number; // Rate of new unique wallets
   initialPrice?: number; // Price at first detection (for rug detection)
+  holderCount?: number; // Last known holder count
+  lastHolderCheck?: number; // Timestamp of last holder count check
 };
 
 // Pool snapshot for monitoring
@@ -1872,6 +1874,20 @@ export class MeteoraDammV2CopyBot {
             // Log batch progress with cumulative insider stats
             console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250 | Insider: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
+            // Check holder count at interval during pending phase
+            const holderExitEnabled = this.config.holderExitEnabled === true;
+            const holderExitCheckIntervalMs = this.config.holderExitCheckIntervalMs ?? 30000;
+            
+            if (holderExitEnabled && this.config.birdeyeApiKey) {
+              const lastHolderCheck = tracker.lastHolderCheck ?? 0;
+              if (now - lastHolderCheck >= holderExitCheckIntervalMs) {
+                const holderCount = await this.getHolderCount(mint);
+                tracker.holderCount = holderCount;
+                tracker.lastHolderCheck = now;
+                console.log(`[EarlyScore] 👥 Holders: ${holderCount} for ${mint.slice(0, 8)}...`);
+              }
+            }
+            
             // Early rejection: if we have 20+ txs and 0 insider activity, stop looking
             // Also reject if 3 minutes passed with 0 insider activity
             const elapsedMs = Date.now() - tracker.startedAt;
@@ -1932,8 +1948,8 @@ export class MeteoraDammV2CopyBot {
           if (insiderPercent >= 90) {
             // >90% insider txs (buy or sell) - BUY
             // But check minimum SOL thresholds first
-            if (totalInsiderBuySol < 13) {
-              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider buys ${totalInsiderBuySol.toFixed(4)} SOL < 13 SOL minimum)`);
+            if (totalInsiderBuySol < 12.5) {
+              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (insider buys ${totalInsiderBuySol.toFixed(4)} SOL < 12.5 SOL minimum)`);
               tracker.evaluated = true;
               this.pendingPositions.delete(mint);
               continue;
