@@ -2629,6 +2629,14 @@ async function main() {
     poolRpcUrl: process.env.POOL_RPC_URL,
     poolCheckIntervalMs: Number(process.env.POOL_CHECK_INTERVAL_MS ?? "2000"),
     profitExitPercent: Number(process.env.PROFIT_EXIT_PERCENT ?? "1"),
+    // Stagnant exit config
+    stagnantExitEnabled: process.env.STAGNANT_EXIT_ENABLED !== "false", // default true
+    stagnantExitBatchCount: Number(process.env.STAGNANT_EXIT_BATCH_COUNT ?? "20"),
+    stagnantExitMinProfit: Number(process.env.STAGNANT_EXIT_MIN_PROFIT ?? "20"),
+    // Volume exit config
+    volumeExitEnabled: process.env.VOLUME_EXIT_ENABLED !== "false", // default true
+    volumeExitBuySol: Number(process.env.VOLUME_EXIT_BUY_SOL ?? "48"),
+    volumeExitSellSol: Number(process.env.VOLUME_EXIT_SELL_SOL ?? "48"),
     // Early score engine wallets
     leaderWallets: process.env.LEADER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
     followerWallets: process.env.FOLLOWER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
