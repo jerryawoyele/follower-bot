@@ -1939,8 +1939,8 @@ export class MeteoraDammV2CopyBot {
           }
         }
         
-        // Check if 30 batches passed without reaching 20% highest profit - exit
-        if (position.batchCount >= 30 && position.highestProfit < 20) {
+        // Check if 20 batches passed without reaching 10% highest profit - exit
+        if (position.batchCount >= 20 && position.highestProfit < 10) {
           console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < 20%)`);
           this.logDominanceStats(mint, "Exit-Stagnant");
           await this.copySell(mint, "STAGNANT_EXIT", 100);
