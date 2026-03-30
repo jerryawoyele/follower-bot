@@ -55,6 +55,14 @@ type BotConfig = {
   poolRpcUrl?: string; // Separate RPC for pool monitoring (avoid rate limits)
   poolCheckIntervalMs?: number; // How often to check pool state (default: 2s)
   profitExitPercent?: number; // Profit % to trigger exit when momentum slowing (default: 20%)
+  // Stagnant exit params (optional)
+  stagnantExitEnabled?: boolean; // Enable stagnant exit trigger (default: true)
+  stagnantExitBatchCount?: number; // Number of batches before stagnant exit (default: 20)
+  stagnantExitMinProfit?: number; // Minimum highest profit % to avoid stagnant exit (default: 20)
+  // Volume exit params (optional)
+  volumeExitEnabled?: boolean; // Enable volume exit trigger (default: true)
+  volumeExitBuySol?: number; // Minimum insider buy SOL for volume exit (default: 48)
+  volumeExitSellSol?: number; // Minimum insider sell SOL for volume exit (default: 48)
   // Early score engine params
   leaderWallets?: string[]; // High-weight known wallets (score +10 each)
   followerWallets?: string[]; // Lower-weight known wallets (score +4 each)
@@ -1929,9 +1937,13 @@ export class MeteoraDammV2CopyBot {
             const cumSellSol = cumInsiderSells.reduce((sum, tx) => sum + (tx.amount || 0), 0);
             console.log(`[OpenPos] 📦 Batch: new=${newInsiderTxs} | Cumulative: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL | batchCount=${position.batchCount}`);
             
-            // Check if both buys and sells have reached 48 SOL - trigger early exit
-            if (cumBuySol >= 48 && cumSellSol >= 48) {
-              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= 48 SOL, sells: ${cumSellSol.toFixed(4)} SOL >= 48 SOL)`);
+            // Check volume exit trigger (if enabled)
+            const volumeExitEnabled = this.config.volumeExitEnabled !== false; // default true
+            const volumeExitBuySol = this.config.volumeExitBuySol ?? 48;
+            const volumeExitSellSol = this.config.volumeExitSellSol ?? 48;
+            
+            if (volumeExitEnabled && cumBuySol >= volumeExitBuySol && cumSellSol >= volumeExitSellSol) {
+              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= ${volumeExitBuySol} SOL, sells: ${cumSellSol.toFixed(4)} SOL >= ${volumeExitSellSol} SOL)`);
               this.logDominanceStats(mint, "Exit-Volume");
               await this.copySell(mint, "VOLUME_EXIT", 100);
               continue;
@@ -1939,9 +1951,13 @@ export class MeteoraDammV2CopyBot {
           }
         }
         
-        // Check if 20 batches passed without reaching 10% highest profit - exit
-        if (position.batchCount >= 20 && position.highestProfit < 10) {
-          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < 20%)`);
+        // Check stagnant exit trigger (if enabled)
+        const stagnantExitEnabled = this.config.stagnantExitEnabled !== false; // default true
+        const stagnantExitBatchCount = this.config.stagnantExitBatchCount ?? 20;
+        const stagnantExitMinProfit = this.config.stagnantExitMinProfit ?? 20;
+        
+        if (stagnantExitEnabled && position.batchCount >= stagnantExitBatchCount && position.highestProfit < stagnantExitMinProfit) {
+          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < ${stagnantExitMinProfit}%)`);
           this.logDominanceStats(mint, "Exit-Stagnant");
           await this.copySell(mint, "STAGNANT_EXIT", 100);
           continue;
