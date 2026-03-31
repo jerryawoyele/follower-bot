@@ -1924,25 +1924,6 @@ export class MeteoraDammV2CopyBot {
               }
             }
             
-            // Early rejection: if we have 20+ txs and 0 insider activity, stop looking
-            // Also reject if 3 minutes passed with 0 insider activity
-            const elapsedMs = Date.now() - tracker.startedAt;
-            const elapsedMin = elapsedMs / 60000;
-            
-            if (tracker.txs.length >= 20 && cumInsiderTxs.length === 0) {
-              console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (${tracker.txs.length} txs, 0 insider activity - pool likely rugged)`);
-              tracker.evaluated = true;
-              this.pendingPositions.delete(mint);
-              break;
-            }
-            
-            if (elapsedMin >= 3 && cumInsiderTxs.length === 0) {
-              console.log(`[Bot] 🔴 REJECT TIMEOUT: ${mint.slice(0, 8)}... (${elapsedMin.toFixed(1)}min elapsed, 0 insider activity)`);
-              tracker.evaluated = true;
-              this.pendingPositions.delete(mint);
-              break;
-            }
-            
             // If we got all new txs (no dups), the pool might have more history - continue fetching
             // If we got dups, we've seen all current txs - break and wait for pool to grow
             if (dupTxs > 0 && newTxs === 0) {
