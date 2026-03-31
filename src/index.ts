@@ -157,7 +157,7 @@ type TokenEarlyMetrics = {
   seenSignatures: Set<string>; // Deduplication - signatures already processed
   rawFetchedCount: number; // Total fetched from API
   duplicateCount: number; // Duplicates skipped
-  lastFetchedSignature?: string; // Cursor for pagination (oldest signature fetched)
+  latestSignature?: string; // Latest signature seen (for pagination to get new txs)
 
   amounts: number[];
   firstSellAtTx?: number;
@@ -655,7 +655,7 @@ export class MeteoraDammV2CopyBot {
       seenSignatures: new Set(),
       rawFetchedCount: 0,
       duplicateCount: 0,
-      lastFetchedSignature: undefined,
+      latestSignature: undefined,
       amounts: [],
       score: 0,
       decision: "none",
@@ -1632,17 +1632,23 @@ export class MeteoraDammV2CopyBot {
   private static readonly METEORA_POOL_AUTHORITY = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC";
 
   // Fetch transactions for a pool with wallet addresses
-  // Uses cursor-based paging - fetches txs newer than the cursor for growing pools
-  private async fetchPoolTransactions(poolAddress: string, afterSignature?: string): Promise<PoolTx[]> {
+  // Pagination strategy:
+  // - First fetch: sort-order=desc (newest first), no after-signature
+  // - Subsequent fetches: sort-order=asc with after-signature=<latest_signature>
+  // - This gets new txs that came in after our last known latest signature
+  private async fetchPoolTransactions(poolAddress: string, afterSignature?: string, isFirstFetch?: boolean): Promise<PoolTx[]> {
     try {
       const url = new URL(`${HELIUS_BASE}/addresses/${poolAddress}/transactions`);
       url.searchParams.set("api-key", this.heliusApiKey);
       url.searchParams.set("limit", "50");
       
-      // Use 'after' cursor for pagination - fetches txs NEWER than this signature
-      // This is correct for new pools where we're waiting for txs to accumulate
-      if (afterSignature) {
-        url.searchParams.set("after", afterSignature);
+      if (isFirstFetch) {
+        // First fetch: get newest txs first (desc order)
+        url.searchParams.set("sort-order", "desc");
+      } else if (afterSignature) {
+        // Subsequent fetches: get txs after the signature in asc order
+        url.searchParams.set("sort-order", "asc");
+        url.searchParams.set("after-signature", afterSignature);
       }
       
       const resp = await fetch(url.toString());
@@ -1822,12 +1828,19 @@ export class MeteoraDammV2CopyBot {
           let totalFetched = 0;
           let totalDups = 0;
           
+          // Determine if this is the first fetch (no latestSignature yet)
+          const isFirstFetch = !tracker.latestSignature;
+          
           // Keep fetching until we have 250 unique txs
-          // Use pagination with 'after' cursor to get older transactions
           while (tracker.txs.length < 250) {
-            // Use the oldest signature we've seen as the cursor to fetch older txs
-            // Helius 'after' parameter fetches txs OLDER than the given signature
-            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, tracker.lastFetchedSignature);
+            // Fetch transactions with proper pagination
+            // - First fetch: sort-order=desc, no after-signature (gets newest txs)
+            // - Subsequent fetches: sort-order=asc, after-signature=latestSignature (gets new txs)
+            const poolTxs = await this.fetchPoolTransactions(
+              pending.poolAddress,
+              isFirstFetch ? undefined : tracker.latestSignature,
+              isFirstFetch && tracker.txs.length === 0
+            );
             if (poolTxs.length === 0) {
               console.log(`[EarlyScore] ⚠️ No more txs in pool, have ${tracker.txs.length}/250`);
               break;
@@ -1836,8 +1849,11 @@ export class MeteoraDammV2CopyBot {
             let newTxs = 0;
             let dupTxs = 0;
             
-            // Sort transactions by timestamp (oldest first) so tx numbering is chronological
-            const sortedPoolTxs = [...poolTxs].sort((a, b) => a.timestamp - b.timestamp);
+            // For first fetch (desc order), sort oldest-first for chronological tx numbering
+            // For subsequent fetches (asc order), txs are already in chronological order
+            const sortedPoolTxs = isFirstFetch && tracker.txs.length === 0
+              ? [...poolTxs].sort((a, b) => a.timestamp - b.timestamp)
+              : poolTxs;
             
             for (const poolTx of sortedPoolTxs) {
               // Deduplicate by signature
@@ -1870,12 +1886,17 @@ export class MeteoraDammV2CopyBot {
             totalFetched += poolTxs.length;
             totalDups += dupTxs;
             
-            // Update cursor to oldest signature in this batch (for next pagination)
-            // Since we sorted oldest-first, the last tx is the newest, first is oldest
-            // But for 'after' cursor, we need the OLDEST signature to get even older txs
-            if (sortedPoolTxs.length > 0) {
-              // The oldest transaction (first after sorting) becomes our new cursor
-              tracker.lastFetchedSignature = sortedPoolTxs[0].signature;
+            // Update latestSignature for next fetch
+            // - First fetch (desc): index 0 is the newest tx
+            // - Subsequent fetches (asc): last index is the newest tx
+            if (poolTxs.length > 0) {
+              if (isFirstFetch && tracker.txs.length === newTxs) {
+                // First fetch: signature at index 0 is the latest
+                tracker.latestSignature = poolTxs[0].signature;
+              } else {
+                // Subsequent fetches (asc order): last signature is the latest
+                tracker.latestSignature = poolTxs[poolTxs.length - 1].signature;
+              }
             }
             
             // Calculate cumulative insider stats for batch log
