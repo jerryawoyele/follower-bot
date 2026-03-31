@@ -1821,19 +1821,23 @@ export class MeteoraDammV2CopyBot {
           let totalDups = 0;
           
           // Keep fetching until we have 250 unique txs
-          // For new pools, we fetch ALL txs each time (no cursor) and deduplicate
+          // Use pagination with 'after' cursor to get older transactions
           while (tracker.txs.length < 250) {
-            // Fetch without cursor - gets all txs for this address (newest first)
-            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress);
+            // Use the oldest signature we've seen as the cursor to fetch older txs
+            // Helius 'after' parameter fetches txs OLDER than the given signature
+            const poolTxs = await this.fetchPoolTransactions(pending.poolAddress, tracker.lastFetchedSignature);
             if (poolTxs.length === 0) {
-              console.log(`[EarlyScore] ⚠️ No txs in pool yet, have ${tracker.txs.length}/250`);
+              console.log(`[EarlyScore] ⚠️ No more txs in pool, have ${tracker.txs.length}/250`);
               break;
             }
             
             let newTxs = 0;
             let dupTxs = 0;
             
-            for (const poolTx of poolTxs) {
+            // Sort transactions by timestamp (oldest first) so tx numbering is chronological
+            const sortedPoolTxs = [...poolTxs].sort((a, b) => a.timestamp - b.timestamp);
+            
+            for (const poolTx of sortedPoolTxs) {
               // Deduplicate by signature
               if (tracker.seenSignatures.has(poolTx.signature)) {
                 dupTxs++;
@@ -1863,6 +1867,14 @@ export class MeteoraDammV2CopyBot {
             
             totalFetched += poolTxs.length;
             totalDups += dupTxs;
+            
+            // Update cursor to oldest signature in this batch (for next pagination)
+            // Since we sorted oldest-first, the last tx is the newest, first is oldest
+            // But for 'after' cursor, we need the OLDEST signature to get even older txs
+            if (sortedPoolTxs.length > 0) {
+              // The oldest transaction (first after sorting) becomes our new cursor
+              tracker.lastFetchedSignature = sortedPoolTxs[0].signature;
+            }
             
             // Calculate cumulative insider stats for batch log
             const cumInsiderTxs = tracker.txs.filter(tx => tx.from && this.insiderWalletSet.has(tx.from));
