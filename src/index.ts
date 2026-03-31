@@ -68,6 +68,8 @@ type BotConfig = {
   holderExitEnabled?: boolean; // Enable holder count exit trigger (default: false)
   holderExitCount?: number; // Number of holders to trigger exit (default: 190)
   holderExitCheckIntervalMs?: number; // How often to check holder count (default: 30000)
+  // Holder count buy filter params (optional)
+  maxHolderCount?: number; // Max holders allowed before buy (default: 160)
   // Early score engine params
   leaderWallets?: string[]; // High-weight known wallets (score +10 each)
   followerWallets?: string[]; // Lower-weight known wallets (score +4 each)
@@ -1973,7 +1975,24 @@ export class MeteoraDammV2CopyBot {
               continue;
             }
             
-            console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% dominance >= 90% threshold)`);
+            // Check holder count - reject if too many holders (token already distributed)
+            const maxHolderCount = this.config.maxHolderCount ?? 160;
+            const currentHolderCount = tracker.holderCount ?? 0;
+            
+            // Fetch holder count if not yet fetched
+            if (currentHolderCount === 0 && this.config.birdeyeApiKey) {
+              const holderCount = await this.getHolderCount(mint);
+              tracker.holderCount = holderCount;
+            }
+            
+            if (tracker.holderCount && tracker.holderCount >= maxHolderCount) {
+              console.log(`[Bot] 🔴 REJECT: ${mint.slice(0, 8)}... (holders: ${tracker.holderCount} >= ${maxHolderCount} max - token already distributed)`);
+              tracker.evaluated = true;
+              this.pendingPositions.delete(mint);
+              continue;
+            }
+            
+            console.log(`[Bot] 🟢 INSIDER BUY TRIGGERED: ${mint.slice(0, 8)}... (${insiderPercent.toFixed(1)}% dominance >= 90% threshold, holders: ${tracker.holderCount ?? 0} < ${maxHolderCount})`);
             tracker.evaluated = true; // Mark as evaluated to prevent re-buy
             this.pendingPositions.delete(mint);
             this.attemptedBuys.add(mint);
@@ -2779,6 +2798,8 @@ async function main() {
     holderExitEnabled: process.env.HOLDER_EXIT_ENABLED === "true", // default false
     holderExitCount: Number(process.env.HOLDER_EXIT_COUNT ?? "190"),
     holderExitCheckIntervalMs: Number(process.env.HOLDER_EXIT_CHECK_INTERVAL_MS ?? "30000"),
+    // Holder count buy filter
+    maxHolderCount: Number(process.env.MAX_HOLDER_COUNT ?? "160"),
     // Early score engine wallets
     leaderWallets: process.env.LEADER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
     followerWallets: process.env.FOLLOWER_WALLETS?.split(",").map(w => w.trim()).filter(Boolean),
