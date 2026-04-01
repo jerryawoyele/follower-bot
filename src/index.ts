@@ -163,6 +163,7 @@ type TokenEarlyMetrics = {
   amounts: number[];
   firstSellAtTx?: number;
   firstSellAtMs?: number;
+  firstInsiderBuyAtTx?: number; // Tx number of first insider buy (for early exit check)
 
   score: number;
   decision: "good" | "bad" | "pending" | "watchlist" | "none";
@@ -1878,6 +1879,19 @@ export class MeteoraDammV2CopyBot {
               if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
                 const solAmount = (poolTx.amount || 0).toFixed(6);
                 console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+                
+                // Track first insider buy tx number for early exit check
+                if (poolTx.side === "buy" && tracker.firstInsiderBuyAtTx === undefined) {
+                  tracker.firstInsiderBuyAtTx = tracker.txs.length;
+                }
+              }
+              
+              // Early exit: first insider buy must be tx #9 or below
+              if (tracker.firstInsiderBuyAtTx !== undefined && tracker.firstInsiderBuyAtTx > 9) {
+                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider buy at tx #${tracker.firstInsiderBuyAtTx} > 9 - insiders too late)`);
+                tracker.evaluated = true;
+                this.pendingPositions.delete(mint);
+                break;
               }
               
               // Stop at 250
