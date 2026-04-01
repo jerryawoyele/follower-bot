@@ -1887,13 +1887,15 @@ export class MeteoraDammV2CopyBot {
                 }
               }
               
-              // Early exit: first insider buy must be tx #9 or below
-              if (tracker.firstInsiderBuyAtTx !== undefined && tracker.firstInsiderBuyAtTx > 9) {
-                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider buy at tx #${tracker.firstInsiderBuyAtTx} > 9 - insiders too late)`);
-                tracker.evaluated = true;
-                this.pendingPositions.delete(mint);
-                break;
-              }
+              // Commented out the first inder buy # exit
+
+              // // Early exit: first insider buy must be tx #9 or below
+              // if (tracker.firstInsiderBuyAtTx !== undefined && tracker.firstInsiderBuyAtTx > 9) {
+              //   console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider buy at tx #${tracker.firstInsiderBuyAtTx} > 9 - insiders too late)`);
+              //   tracker.evaluated = true;
+              //   this.pendingPositions.delete(mint);
+              //   break;
+              // }
               
               // Stop at 250
               if (tracker.txs.length >= 250) break;
