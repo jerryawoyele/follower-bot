@@ -163,7 +163,7 @@ type TokenEarlyMetrics = {
   amounts: number[];
   firstSellAtTx?: number;
   firstSellAtMs?: number;
-  firstInsiderBuyAtTx?: number; // Tx number of first insider buy (for early exit check)
+  firstInsiderActivityAtTx?: number; // Tx number of first insider activity (buy or sell)
 
   score: number;
   decision: "good" | "bad" | "pending" | "watchlist" | "none";
@@ -1881,15 +1881,15 @@ export class MeteoraDammV2CopyBot {
                 const solAmount = (poolTx.amount || 0).toFixed(6);
                 console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet.slice(0, 8)}... (tx #${txNumber})`);
                 
-                // Track first insider buy tx number for early exit check
-                if (poolTx.side === "buy" && tracker.firstInsiderBuyAtTx === undefined) {
-                  tracker.firstInsiderBuyAtTx = txNumber;
+                // Track first insider activity (buy OR sell) tx number for early exit check
+                if (tracker.firstInsiderActivityAtTx === undefined) {
+                  tracker.firstInsiderActivityAtTx = txNumber;
                 }
               }
               
-              // Early exit: first insider buy must be tx #9 or below
-              if (tracker.firstInsiderBuyAtTx !== undefined && tracker.firstInsiderBuyAtTx > 9) {
-                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider buy at tx #${tracker.firstInsiderBuyAtTx} > 9 - insiders too late)`);
+              // Early exit: first insider activity must be tx #9 or below
+              if (tracker.firstInsiderActivityAtTx !== undefined && tracker.firstInsiderActivityAtTx > 9) {
+                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider activity at tx #${tracker.firstInsiderActivityAtTx} > 9 - insiders too late)`);
                 tracker.evaluated = true;
                 this.pendingPositions.delete(mint);
                 break;
