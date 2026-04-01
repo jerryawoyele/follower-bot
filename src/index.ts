@@ -1851,11 +1851,9 @@ export class MeteoraDammV2CopyBot {
             let newTxs = 0;
             let dupTxs = 0;
             
-            // For first fetch (desc order), sort oldest-first for chronological tx numbering
-            // For subsequent fetches (asc order), txs are already in chronological order
-            const sortedPoolTxs = isFirstFetch && tracker.txs.length === 0
-              ? [...poolTxs].sort((a, b) => a.timestamp - b.timestamp)
-              : poolTxs;
+            // Always sort by timestamp (oldest first) to ensure correct tx numbering
+            // This guarantees chronological order regardless of API sort-order
+            const sortedPoolTxs = [...poolTxs].sort((a, b) => a.timestamp - b.timestamp);
             
             for (const poolTx of sortedPoolTxs) {
               // Deduplicate by signature
@@ -1865,6 +1863,9 @@ export class MeteoraDammV2CopyBot {
               }
               tracker.seenSignatures.add(poolTx.signature);
               newTxs++;
+              
+              // Capture tx position BEFORE adding (1-indexed)
+              const txNumber = tracker.txs.length + 1;
               
               const earlyTx: EarlyTx = {
                 signature: poolTx.signature,
@@ -1878,11 +1879,11 @@ export class MeteoraDammV2CopyBot {
               // Log insider wallets (buy or sell) with SOL amount
               if (poolTx.wallet && this.insiderWalletSet.has(poolTx.wallet)) {
                 const solAmount = (poolTx.amount || 0).toFixed(6);
-                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet.slice(0, 8)}... (tx #${tracker.txs.length})`);
+                console.log(`[EarlyScore] 🟪 INSIDER ${poolTx.side.toUpperCase()} ${solAmount} SOL: ${poolTx.wallet.slice(0, 8)}... (tx #${txNumber})`);
                 
                 // Track first insider buy tx number for early exit check
                 if (poolTx.side === "buy" && tracker.firstInsiderBuyAtTx === undefined) {
-                  tracker.firstInsiderBuyAtTx = tracker.txs.length;
+                  tracker.firstInsiderBuyAtTx = txNumber;
                 }
               }
               
