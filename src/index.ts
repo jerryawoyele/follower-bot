@@ -1888,8 +1888,8 @@ export class MeteoraDammV2CopyBot {
               }
               
               // Early exit: first insider activity must be tx #9 or below
-              if (tracker.firstInsiderActivityAtTx !== undefined && tracker.firstInsiderActivityAtTx > 9) {
-                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider activity at tx #${tracker.firstInsiderActivityAtTx} > 9 - insiders too late)`);
+              if (tracker.firstInsiderActivityAtTx !== undefined && tracker.firstInsiderActivityAtTx > 8) {
+                console.log(`[Bot] 🔴 REJECT EARLY: ${mint.slice(0, 8)}... (first insider activity at tx #${tracker.firstInsiderActivityAtTx} > 8 - insiders too late)`);
                 tracker.evaluated = true;
                 this.pendingPositions.delete(mint);
                 break;
