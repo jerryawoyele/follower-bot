@@ -252,6 +252,7 @@ type FollowState = {
   lastDirection: "BUY" | "SELL" | "NONE"; // Last detected direction
   entryPrice?: number; // Price at entry (from pool)
   highestProfit: number; // Highest profit % reached
+  currentProfit?: number; // Current profit % (real-time, for exit triggers)
   // Enhanced momentum tracking for exits
   momentumScore: number;
   momentumHistory: number[]; // Last N momentum values for slope detection
@@ -1925,20 +1926,6 @@ export class MeteoraDammV2CopyBot {
             // Log batch progress with cumulative insider stats
             console.log(`[EarlyScore] 📦 Batch: fetched=${poolTxs.length} new=${newTxs} dups=${dupTxs} | Total: ${tracker.txs.length}/250 | Insider: ${cumInsiderBuys.length} buys: ${cumBuySol.toFixed(4)} SOL, ${cumInsiderSells.length} sells: ${cumSellSol.toFixed(4)} SOL`);
             
-            // Check holder count at interval during pending phase
-            const holderExitEnabled = this.config.holderExitEnabled === true;
-            const holderExitCheckIntervalMs = this.config.holderExitCheckIntervalMs ?? 30000;
-            
-            if (holderExitEnabled && this.config.birdeyeApiKey) {
-              const lastHolderCheck = tracker.lastHolderCheck ?? 0;
-              if (now - lastHolderCheck >= holderExitCheckIntervalMs) {
-                const holderCount = await this.getHolderCount(mint);
-                tracker.holderCount = holderCount;
-                tracker.lastHolderCheck = now;
-                console.log(`[EarlyScore] 👥 Holders: ${holderCount} for ${mint.slice(0, 8)}...`);
-              }
-            }
-            
             // If we got all new txs (no dups), the pool might have more history - continue fetching
             // If we got dups, we've seen all current txs - break and wait for pool to grow
             if (dupTxs > 0 && newTxs === 0) {
@@ -2049,6 +2036,28 @@ export class MeteoraDammV2CopyBot {
       if (!position.poolAddress) continue;
 
       try {
+        // Get real pool state FIRST to calculate current profit for exit triggers
+        const snapshot = await this.getPoolSnapshot(position.poolAddress);
+        if (!snapshot) continue;
+
+        if (!position.prevPoolSnapshot) {
+          position.prevPoolSnapshot = snapshot;
+          position.entryPrice = snapshot.price;
+          console.log(`[Pool] ${mint.slice(0, 8)}... position initialized entryPrice=${snapshot.price.toFixed(9)}`);
+          continue;
+        }
+
+        // Calculate current profit
+        let currentProfit = 0;
+        if (position.entryPrice && position.entryPrice > 0) {
+          currentProfit = ((snapshot.price - position.entryPrice) / position.entryPrice) * 100;
+          position.currentProfit = currentProfit;
+          
+          if (currentProfit > position.highestProfit) {
+            position.highestProfit = currentProfit;
+          }
+        }
+        
         // Fetch recent pool txs to log insider activity for open positions
         const poolTxs = await this.fetchPoolTransactions(position.poolAddress);
         let newInsiderTxs = 0;
@@ -2098,8 +2107,8 @@ export class MeteoraDammV2CopyBot {
             const volumeExitBuySol = this.config.volumeExitBuySol ?? 48;
             const volumeExitSellSol = this.config.volumeExitSellSol ?? 48;
             
-            if (volumeExitEnabled && cumBuySol >= volumeExitBuySol && cumSellSol >= volumeExitSellSol && position.highestProfit > 0) {
-              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= ${volumeExitBuySol} SOL, sells: ${cumSellSol.toFixed(4)} SOL >= ${volumeExitSellSol} SOL, profit: ${position.highestProfit.toFixed(1)}% > 0%)`);
+            if (volumeExitEnabled && cumBuySol >= volumeExitBuySol && cumSellSol >= volumeExitSellSol && currentProfit > 0) {
+              console.log(`[Bot] 🚨 VOLUME EXIT TRIGGERED: ${mint.slice(0, 8)}... (insider buys: ${cumBuySol.toFixed(4)} SOL >= ${volumeExitBuySol} SOL, sells: ${cumSellSol.toFixed(4)} SOL >= ${volumeExitSellSol} SOL, profit: ${currentProfit.toFixed(1)}% > 0%)`);
               this.logDominanceStats(mint, "Exit-Volume");
               await this.copySell(mint, "VOLUME_EXIT", 100);
               continue;
@@ -2112,8 +2121,8 @@ export class MeteoraDammV2CopyBot {
         const stagnantExitBatchCount = this.config.stagnantExitBatchCount ?? 20;
         const stagnantExitMinProfit = this.config.stagnantExitMinProfit ?? 20;
         
-        if (stagnantExitEnabled && position.batchCount >= stagnantExitBatchCount && position.highestProfit < stagnantExitMinProfit && position.highestProfit > 0) {
-          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < ${stagnantExitMinProfit}%, in profit)`);
+        if (stagnantExitEnabled && position.batchCount >= stagnantExitBatchCount && position.highestProfit < stagnantExitMinProfit && currentProfit > 0) {
+          console.log(`[Bot] 🚨 STagnant EXIT TRIGGERED: ${mint.slice(0, 8)}... (${position.batchCount} batches, highestProfit=${position.highestProfit.toFixed(1)}% < ${stagnantExitMinProfit}%, current profit: ${currentProfit.toFixed(1)}%)`);
           this.logDominanceStats(mint, "Exit-Stagnant");
           await this.copySell(mint, "STAGNANT_EXIT", 100);
           continue;
@@ -2135,9 +2144,9 @@ export class MeteoraDammV2CopyBot {
             position.lastHolderCheck = now;
             console.log(`[Holder] ${mint.slice(0, 8)}... holderCount=${holderCount}`);
             
-            // Exit if holder count >= threshold AND in profit
-            if (holderCount >= holderExitCount && position.highestProfit > 0) {
-              console.log(`[Bot] 🚨 HOLDER EXIT TRIGGERED: ${mint.slice(0, 8)}... (holders: ${holderCount} >= ${holderExitCount}, profit: ${position.highestProfit.toFixed(1)}% > 0%)`);
+            // Exit if holder count >= threshold AND currently in profit
+            if (holderCount >= holderExitCount && currentProfit > 0) {
+              console.log(`[Bot] 🚨 HOLDER EXIT TRIGGERED: ${mint.slice(0, 8)}... (holders: ${holderCount} >= ${holderExitCount}, profit: ${currentProfit.toFixed(1)}% > 0%)`);
               this.logDominanceStats(mint, "Exit-Holder");
               await this.copySell(mint, "HOLDER_EXIT", 100);
               continue;
@@ -2145,27 +2154,10 @@ export class MeteoraDammV2CopyBot {
           }
         }
 
-        // Get real pool state from CpAmm SDK
-        const snapshot = await this.getPoolSnapshot(position.poolAddress);
-        if (!snapshot) continue;
-
-        if (!position.prevPoolSnapshot) {
-          position.prevPoolSnapshot = snapshot;
-          position.entryPrice = snapshot.price;
-          console.log(`[Pool] ${mint.slice(0, 8)}... position initialized entryPrice=${snapshot.price.toFixed(9)}`);
-          continue;
-        }
-
-        // Calculate profit
+        // Log pool status and handle TP/SL exits
         if (position.entryPrice && position.entryPrice > 0) {
-          const profitPct = ((snapshot.price - position.entryPrice) / position.entryPrice) * 100;
-          
-          if (profitPct > position.highestProfit) {
-            position.highestProfit = profitPct;
-          }
-
           // Log pool status
-          console.log(`[Pool] ${mint.slice(0, 8)}... profit=${profitPct.toFixed(1)}% price=${snapshot.price.toFixed(9)} highestProfit=${position.highestProfit.toFixed(1)}%`);
+          console.log(`[Pool] ${mint.slice(0, 8)}... profit=${currentProfit.toFixed(1)}% price=${snapshot.price.toFixed(9)} highestProfit=${position.highestProfit.toFixed(1)}%`);
 
           // ===== TP/SL EXIT LOGIC ONLY =====
           // TP1: Sell TP1_SELL_PERCENT at TP1_TRIGGER multiplier
